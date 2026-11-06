@@ -84,7 +84,7 @@ impl Editor {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
-                .code_editor("plain_text")
+                .code_editor("text")
                 .line_number(true)
                 .placeholder("开始输入，或按 Ctrl+O 打开文本文件…")
         });
@@ -114,6 +114,12 @@ impl Editor {
             message: "就绪".into(),
             _subscriptions: vec![subscription],
         }
+    }
+
+    fn update_language(&mut self, cx: &mut Context<Self>) {
+        let language = detect_language(self.path.as_deref()).0;
+        self.input
+            .update(cx, |state, cx| state.set_highlighter(language, cx));
     }
 
     fn text(&self, cx: &App) -> String {
@@ -173,6 +179,7 @@ impl Editor {
             return false;
         }
         self.path = Some(path);
+        self.update_language(cx);
         self.saved_text = text;
         self.message = "已保存".into();
         self.input.update(cx, |state, cx| state.focus(window, cx));
@@ -210,6 +217,7 @@ impl Editor {
             return;
         }
         self.path = None;
+        self.update_language(cx);
         self.saved_text.clear();
         self.bom = false;
         self.crlf = true;
@@ -255,6 +263,7 @@ impl Editor {
                     return;
                 }
                 self.path = Some(path);
+                self.update_language(cx);
                 self.saved_text = text.clone();
                 self.crlf = crlf;
                 self.bom = bom;
@@ -449,6 +458,63 @@ impl Editor {
     }
 }
 
+/// Use the exact language IDs registered by gpui-component's Tree-sitter backend.
+fn detect_language(path: Option<&Path>) -> (&'static str, &'static str) {
+    let Some(path) = path else {
+        return ("text", "纯文本");
+    };
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "makefile" | "gnumakefile" => return ("make", "Makefile"),
+        "cmakelists.txt" => return ("cmake", "CMake"),
+        ".bashrc" | ".bash_profile" | ".profile" => return ("bash", "Shell"),
+        _ => {}
+    }
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "rs" => ("rust", "Rust"),
+        "py" | "pyw" | "pyi" => ("python", "Python"),
+        "js" | "jsx" | "mjs" | "cjs" => ("javascript", "JavaScript / JSX"),
+        "ts" | "mts" | "cts" => ("typescript", "TypeScript"),
+        "tsx" => ("tsx", "TSX"),
+        "c" | "h" => ("c", "C"),
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => ("cpp", "C++"),
+        "cs" => ("csharp", "C#"),
+        "java" => ("java", "Java"),
+        "go" => ("go", "Go"),
+        "rb" | "rake" | "gemspec" => ("ruby", "Ruby"),
+        "swift" => ("swift", "Swift"),
+        "scala" | "sc" => ("scala", "Scala"),
+        "zig" => ("zig", "Zig"),
+        "ex" | "exs" => ("elixir", "Elixir"),
+        "sh" | "bash" => ("bash", "Shell"),
+        "html" | "htm" => ("html", "HTML"),
+        "css" => ("css", "CSS"),
+        "json" => ("json", "JSON"),
+        "toml" => ("toml", "TOML"),
+        "yaml" | "yml" => ("yaml", "YAML"),
+        "md" | "markdown" => ("markdown", "Markdown"),
+        "sql" => ("sql", "SQL"),
+        "graphql" | "gql" => ("graphql", "GraphQL"),
+        "proto" => ("proto", "Protocol Buffers"),
+        "cmake" => ("cmake", "CMake"),
+        "mk" => ("make", "Makefile"),
+        "diff" | "patch" => ("diff", "Diff"),
+        "ejs" => ("ejs", "EJS"),
+        "erb" => ("erb", "ERB"),
+        _ => ("text", "纯文本"),
+    }
+}
+
 fn decode_text(bytes: &[u8]) -> Result<(String, bool, bool), String> {
     let bom = bytes.starts_with(&[0xef, 0xbb, 0xbf]);
     let bytes = if bom { &bytes[3..] } else { bytes };
@@ -607,7 +673,8 @@ impl Render for Editor {
                         self.message, lines, chars
                     ))
                     .child(format!(
-                        "UTF-8{}   |   {}   |   Ctrl+F 查找 / 替换",
+                        "{}   |   UTF-8{}   |   {}   |   Ctrl+F 查找 / 替换",
+                        detect_language(self.path.as_deref()).1,
                         if self.bom { " BOM" } else { "" },
                         if self.crlf { "CRLF" } else { "LF" }
                     )),
@@ -664,7 +731,43 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_text, encode_text};
+    use super::{decode_text, detect_language, encode_text};
+    #[test]
+    fn detects_common_languages_and_special_filenames() {
+        for (file, expected) in [
+            ("main.RS", "rust"),
+            ("hello.py", "python"),
+            ("app.jsx", "javascript"),
+            ("app.ts", "typescript"),
+            ("app.tsx", "tsx"),
+            ("main.c", "c"),
+            ("main.hpp", "cpp"),
+            ("Program.cs", "csharp"),
+            ("Main.java", "java"),
+            ("main.go", "go"),
+            ("index.html", "html"),
+            ("style.css", "css"),
+            ("a.json", "json"),
+            ("Cargo.toml", "toml"),
+            ("a.yml", "yaml"),
+            ("README.md", "markdown"),
+            ("a.sql", "sql"),
+            ("run.sh", "bash"),
+            ("Makefile", "make"),
+            ("CMakeLists.txt", "cmake"),
+            (".bashrc", "bash"),
+            ("a.txt", "text"),
+            ("a.unknown", "text"),
+        ] {
+            assert_eq!(
+                detect_language(Some(std::path::Path::new(file))).0,
+                expected,
+                "{file}"
+            );
+        }
+        assert_eq!(detect_language(None).0, "text");
+    }
+
     #[test]
     fn utf8_bom_and_windows_line_endings_round_trip() {
         let input = b"\xef\xbb\xbfhello\r\nworld\r\n";
@@ -702,6 +805,54 @@ mod tests {
             assert_eq!(decoded, text);
             assert_eq!((actual_crlf, actual_bom), (crlf, bom));
             assert_eq!(encode_text(&decoded, actual_crlf, actual_bom), bytes);
+        }
+    }
+
+    #[test]
+    fn parses_all_supported_languages_with_tree_sitter() {
+        for lang in [
+            "rust",
+            "python",
+            "javascript",
+            "typescript",
+            "tsx",
+            "c",
+            "cpp",
+            "csharp",
+            "java",
+            "go",
+            "ruby",
+            "swift",
+            "scala",
+            "zig",
+            "elixir",
+            "bash",
+            "html",
+            "css",
+            "json",
+            "toml",
+            "yaml",
+            "markdown",
+            "sql",
+            "graphql",
+            "proto",
+            "cmake",
+            "make",
+            "diff",
+            "ejs",
+            "erb",
+            "text",
+        ] {
+            if lang == "text" {
+                continue;
+            }
+            let language = gpui_component::highlighter::Language::from_str(lang);
+            assert_ne!(language.name(), "text", "语言 {lang} 应该被识别为有效语法");
+            let parser = gpui_component::highlighter::LanguageRegistry::singleton().language(lang);
+            assert!(
+                parser.is_some(),
+                "语言 {lang} 应该能够成功载入 Tree-sitter 语法解析器"
+            );
         }
     }
 
