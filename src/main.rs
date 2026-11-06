@@ -682,8 +682,27 @@ impl Render for Editor {
     }
 }
 
+// Windows file associations pass the selected path as an OS-string argument.
+// Keep it lossless, including Unicode and spaces; quotes are handled by the OS.
+fn startup_path(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<PathBuf> {
+    args.into_iter()
+        .skip(1)
+        .find(|arg| !arg.is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&path))
+                    .unwrap_or(path)
+            }
+        })
+}
+
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    let initial_path = startup_path(std::env::args_os());
+    Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         cx.bind_keys([
@@ -714,8 +733,31 @@ fn main() {
                 window_min_size: Some(size(px(720.), px(420.))),
                 ..Default::default()
             },
-            |window, cx| {
-                let editor = cx.new(|cx| Editor::new(window, cx));
+            move |window, cx| {
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::new(window, cx);
+                    if let Some(path) = initial_path {
+                        let root = if path.is_dir() {
+                            Some(path.clone())
+                        } else {
+                            path.parent().map(Path::to_path_buf)
+                        };
+                        if let Some(root) = root {
+                            editor.tree_cache.clear();
+                            editor.expanded.clear();
+                            if let Ok(entries) = read_directory(&root) {
+                                editor.tree_cache.insert(root.clone(), entries);
+                            }
+                            editor.tree_root = Some(root);
+                        }
+                        if path.is_dir() {
+                            editor.message = "文件夹已打开".into();
+                        } else {
+                            editor.open_path(path, window, cx);
+                        }
+                    }
+                    editor
+                });
                 let weak = editor.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {
                     weak.update(cx, |editor, cx| editor.confirm_discard(window, cx))
@@ -732,6 +774,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{decode_text, detect_language, encode_text};
+    #[test]
+    fn startup_without_file_keeps_blank_document() {
+        assert_eq!(super::startup_path(["editor.exe".into()]), None);
+    }
+
+    #[test]
+    fn startup_preserves_chinese_and_spaces() {
+        let path = std::path::PathBuf::from(r"C:\中文目录\我的 文档.md");
+        let actual = super::startup_path(["editor.exe".into(), path.clone().into_os_string()]);
+        assert_eq!(actual, Some(path));
+    }
+
+    #[test]
+    fn startup_resolves_relative_markdown_path() {
+        let path = super::startup_path(["editor.exe".into(), "文档 示例.md".into()]).unwrap();
+        assert_eq!(path, std::env::current_dir().unwrap().join("文档 示例.md"));
+        assert_eq!(detect_language(Some(&path)).0, "markdown");
+    }
+
     #[test]
     fn detects_common_languages_and_special_filenames() {
         for (file, expected) in [
