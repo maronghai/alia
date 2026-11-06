@@ -6,9 +6,24 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
-use std::{fs, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
-actions!(editor, [NewFile, OpenFile, SaveFile, SaveAs]);
+actions!(
+    editor,
+    [
+        NewFile,
+        OpenFile,
+        SaveFile,
+        SaveAs,
+        OpenFolder,
+        ToggleTree,
+        RefreshTree
+    ]
+);
 
 // Native modal dialogs pump Windows messages. Running them inside a GPUI
 // entity update can re-enter the UI while it is mutably borrowed. Keep their
@@ -24,8 +39,39 @@ fn native_dialog<T: Send + 'static>(
         .map_err(|_| "文件对话框意外退出，请重试。".to_string())
 }
 
+#[derive(Clone)]
+struct TreeEntry {
+    path: PathBuf,
+    name: String,
+    directory: bool,
+}
+
+fn read_directory(path: &Path) -> Result<Vec<TreeEntry>, String> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        entries.push(TreeEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path: entry.path(),
+            directory: kind.is_dir() && !kind.is_symlink(),
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.directory
+            .cmp(&a.directory)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(entries)
+}
+
 struct Editor {
     input: Entity<InputState>,
+    tree_root: Option<PathBuf>,
+    tree_cache: HashMap<PathBuf, Vec<TreeEntry>>,
+    expanded: HashSet<PathBuf>,
+    tree_visible: bool,
     path: Option<PathBuf>,
     saved_text: String,
     crlf: bool,
@@ -48,8 +94,19 @@ impl Editor {
             }
         });
         input.update(cx, |state, cx| state.focus(window, cx));
+        let tree_root = std::env::current_dir().ok();
+        let mut tree_cache = HashMap::new();
+        if let Some(root) = &tree_root {
+            if let Ok(entries) = read_directory(root) {
+                tree_cache.insert(root.clone(), entries);
+            }
+        }
         Self {
             input,
+            tree_root,
+            tree_cache,
+            expanded: HashSet::new(),
+            tree_visible: true,
             path: None,
             saved_text: String::new(),
             crlf: true,
@@ -185,6 +242,10 @@ impl Editor {
                 return;
             }
         };
+        self.open_path(path, window, cx);
+    }
+
+    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let decoded = fs::read(&path)
             .map_err(|e| e.to_string())
             .and_then(|bytes| decode_text(&bytes));
@@ -206,6 +267,178 @@ impl Editor {
             }
             Err(err) => self.error(format!("无法打开文件 {}：{err}", path.display()), cx),
         }
+    }
+
+    fn open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
+        let initial = self.tree_root.clone();
+        match native_dialog(move || {
+            let mut dialog = FileDialog::new().set_title("打开文件夹");
+            if let Some(root) = initial {
+                dialog = dialog.set_directory(root);
+            }
+            dialog.pick_folder()
+        }) {
+            Ok(Some(root)) => match read_directory(&root) {
+                Ok(entries) => {
+                    self.tree_cache.clear();
+                    self.expanded.clear();
+                    self.tree_cache.insert(root.clone(), entries);
+                    self.tree_root = Some(root);
+                    self.tree_visible = true;
+                    self.message = "文件夹已打开".into();
+                }
+                Err(err) => self.message = format!("无法读取文件夹：{err}"),
+            },
+            Ok(None) => return,
+            Err(err) => self.message = err,
+        }
+        cx.notify();
+    }
+
+    fn toggle_tree(&mut self, _: &ToggleTree, _: &mut Window, cx: &mut Context<Self>) {
+        self.tree_visible = !self.tree_visible;
+        cx.notify();
+    }
+
+    fn refresh_tree(&mut self, _: &RefreshTree, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.tree_root.clone() else {
+            return;
+        };
+        let mut paths: Vec<_> = self.expanded.iter().cloned().collect();
+        paths.push(root);
+        let mut errors = Vec::new();
+        for path in paths {
+            match read_directory(&path) {
+                Ok(entries) => {
+                    self.tree_cache.insert(path, entries);
+                }
+                Err(err) => {
+                    self.tree_cache.remove(&path);
+                    errors.push(format!("{}：{err}", path.display()));
+                }
+            }
+        }
+        self.message = if errors.is_empty() {
+            "文件树已刷新".into()
+        } else {
+            format!("刷新失败：{}", errors.join("；"))
+        };
+        cx.notify();
+    }
+
+    fn tree_rows(&self, path: &Path, depth: usize, rows: &mut Vec<(TreeEntry, usize)>) {
+        if let Some(entries) = self.tree_cache.get(path) {
+            for entry in entries {
+                rows.push((entry.clone(), depth));
+                if entry.directory && self.expanded.contains(&entry.path) {
+                    self.tree_rows(&entry.path, depth + 1, rows);
+                }
+            }
+        }
+    }
+
+    fn tree_panel(&self, cx: &mut Context<Self>) -> Div {
+        let mut rows = Vec::new();
+        if let Some(root) = &self.tree_root {
+            self.tree_rows(root, 0, &mut rows);
+        }
+        let root_name = self
+            .tree_root
+            .as_ref()
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or(p.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or("未打开文件夹".into());
+        div()
+            .w(px(250.))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x192233))
+            .border_r_1()
+            .border_color(rgb(0x303b50))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .child("资源管理器"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .px_2()
+                    .pb_2()
+                    .child(tool("tree-open", "打开文件夹").on_click(
+                        cx.listener(|this, _, w, cx| this.open_folder(&OpenFolder, w, cx)),
+                    ))
+                    .child(tool("tree-refresh", "刷新").on_click(
+                        cx.listener(|this, _, w, cx| this.refresh_tree(&RefreshTree, w, cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .overflow_hidden()
+                    .child(root_name),
+            )
+            .child(
+                div()
+                    .id("file-tree-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows.into_iter().enumerate().map(|(index, (entry, depth))| {
+                        let active = self.path.as_ref() == Some(&entry.path);
+                        let expanded = self.expanded.contains(&entry.path);
+                        let label = format!(
+                            "{} {}",
+                            if entry.directory {
+                                if expanded { "▾" } else { "▸" }
+                            } else {
+                                "·"
+                            },
+                            entry.name
+                        );
+                        div()
+                            .id(("file-tree-row", index))
+                            .pl(px(12. + depth as f32 * 16.))
+                            .pr_2()
+                            .py_1()
+                            .text_sm()
+                            .cursor_pointer()
+                            .overflow_hidden()
+                            .bg(rgb(if active { 0x30496b } else { 0x192233 }))
+                            .hover(|style| style.bg(rgb(0x293a53)))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                if entry.directory {
+                                    if this.expanded.remove(&entry.path) {
+                                        cx.notify();
+                                        return;
+                                    }
+                                    match read_directory(&entry.path) {
+                                        Ok(entries) => {
+                                            this.tree_cache.insert(entry.path.clone(), entries);
+                                            this.expanded.insert(entry.path.clone());
+                                        }
+                                        Err(err) => this.message = format!("无法读取目录：{err}"),
+                                    }
+                                    cx.notify();
+                                } else {
+                                    this.open_path(entry.path.clone(), w, cx);
+                                }
+                            }))
+                    })),
+            )
     }
 
     fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -284,6 +517,9 @@ impl Render for Editor {
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::save_as))
+            .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::toggle_tree))
+            .on_action(cx.listener(Self::refresh_tree))
             .child(
                 div()
                     .flex()
@@ -299,6 +535,9 @@ impl Render for Editor {
                             .mr_4()
                             .child("Ferrite"),
                     )
+                    .child(tool("toggle-tree", "文件树").on_click(
+                        cx.listener(|this, _, w, cx| this.toggle_tree(&ToggleTree, w, cx)),
+                    ))
                     .child(
                         tool("new", "新建  Ctrl+N")
                             .on_click(cx.listener(|this, _, w, cx| this.new_file(&NewFile, w, cx))),
@@ -339,13 +578,20 @@ impl Render for Editor {
                     })),
             )
             .child(
-                div().flex_1().min_h_0().px_3().pb_2().child(
-                    Input::new(&self.input)
-                        .h_full()
-                        .appearance(false)
-                        .font_family("Cascadia Code")
-                        .text_size(px(16.)),
-                ),
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .children(self.tree_visible.then(|| self.tree_panel(cx)))
+                    .child(
+                        div().flex_1().min_w_0().h_full().px_3().pb_2().child(
+                            Input::new(&self.input)
+                                .h_full()
+                                .appearance(false)
+                                .font_family("Cascadia Code")
+                                .text_size(px(16.)),
+                        ),
+                    ),
             )
             .child(
                 div()
@@ -378,6 +624,8 @@ fn main() {
             KeyBinding::new("ctrl-o", OpenFile, None),
             KeyBinding::new("ctrl-s", SaveFile, None),
             KeyBinding::new("ctrl-shift-s", SaveAs, None),
+            KeyBinding::new("ctrl-shift-o", OpenFolder, None),
+            KeyBinding::new("ctrl-b", ToggleTree, None),
         ]);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
