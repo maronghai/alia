@@ -21,7 +21,10 @@ actions!(
         SaveAs,
         OpenFolder,
         ToggleTree,
-        RefreshTree
+        RefreshTree,
+        CloseTab,
+        NextTab,
+        PreviousTab
     ]
 );
 
@@ -66,22 +69,57 @@ fn read_directory(path: &Path) -> Result<Vec<TreeEntry>, String> {
     Ok(entries)
 }
 
-struct Editor {
+struct Document {
     input: Entity<InputState>,
-    tree_root: Option<PathBuf>,
-    tree_cache: HashMap<PathBuf, Vec<TreeEntry>>,
-    expanded: HashSet<PathBuf>,
-    tree_visible: bool,
     path: Option<PathBuf>,
     saved_text: String,
     crlf: bool,
     bom: bool,
+    untitled_id: usize,
+    _subscription: Subscription,
+}
+
+struct Editor {
+    tabs: Vec<Document>,
+    active_tab: usize,
+    next_untitled_id: usize,
+    tree_root: Option<PathBuf>,
+    tree_cache: HashMap<PathBuf, Vec<TreeEntry>>,
+    expanded: HashSet<PathBuf>,
+    tree_visible: bool,
     message: String,
-    _subscriptions: Vec<Subscription>,
+}
+
+impl std::ops::Deref for Editor {
+    type Target = Document;
+    fn deref(&self) -> &Document {
+        &self.tabs[self.active_tab]
+    }
+}
+impl std::ops::DerefMut for Editor {
+    fn deref_mut(&mut self) -> &mut Document {
+        &mut self.tabs[self.active_tab]
+    }
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn next_tab_index(active: usize, count: usize, forward: bool) -> usize {
+    if forward {
+        (active + 1) % count
+    } else {
+        (active + count - 1) % count
+    }
 }
 
 impl Editor {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn create_document(
+        untitled_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Document {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("text")
@@ -93,7 +131,22 @@ impl Editor {
                 cx.notify();
             }
         });
-        input.update(cx, |state, cx| state.focus(window, cx));
+        Document {
+            input,
+            path: None,
+            saved_text: String::new(),
+            crlf: true,
+            bom: false,
+            untitled_id,
+            _subscription: subscription,
+        }
+    }
+
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let document = Self::create_document(1, window, cx);
+        document
+            .input
+            .update(cx, |state, cx| state.focus(window, cx));
         let tree_root = std::env::current_dir().ok();
         let mut tree_cache = HashMap::new();
         if let Some(root) = &tree_root {
@@ -102,17 +155,14 @@ impl Editor {
             }
         }
         Self {
-            input,
+            tabs: vec![document],
+            active_tab: 0,
+            next_untitled_id: 2,
             tree_root,
             tree_cache,
             expanded: HashSet::new(),
             tree_visible: true,
-            path: None,
-            saved_text: String::new(),
-            crlf: true,
-            bom: false,
             message: "就绪".into(),
-            _subscriptions: vec![subscription],
         }
     }
 
@@ -172,6 +222,19 @@ impl Editor {
         } else {
             self.path.clone().unwrap()
         };
+        let path = normalized_path(&path);
+        if self
+            .tabs
+            .iter()
+            .enumerate()
+            .any(|(i, tab)| i != self.active_tab && tab.path.as_ref() == Some(&path))
+        {
+            self.error(
+                "该文件已在其他标签中打开，请切换到对应标签保存。".into(),
+                cx,
+            );
+            return false;
+        }
         let text = self.text(cx);
         let output = encode_text(&text, self.crlf, self.bom);
         if let Err(err) = fs::write(&path, output) {
@@ -191,12 +254,11 @@ impl Editor {
         if !self.dirty(cx) {
             return true;
         }
-        let decision = native_dialog(|| {
+        let name = self.document_name(self.active_tab);
+        let decision = native_dialog(move || {
             MessageDialog::new()
             .set_title("保存更改")
-            .set_description(
-                "当前文档有未保存的更改。是否先保存？\n选择“否”将放弃更改，选择“取消”返回编辑。",
-            )
+            .set_description(format!("文档“{name}”有未保存的更改。是否先保存？\n选择“否”将放弃更改，选择“取消”返回编辑。"))
             .set_level(MessageLevel::Warning)
             .set_buttons(MessageButtons::YesNoCancel)
             .show()
@@ -212,21 +274,130 @@ impl Editor {
         }
     }
 
-    fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.confirm_discard(window, cx) {
+    fn document_name(&self, index: usize) -> String {
+        let doc = &self.tabs[index];
+        doc.path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("未命名-{}.txt", doc.untitled_id))
+    }
+
+    fn switch_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
             return;
         }
-        self.path = None;
-        self.update_language(cx);
-        self.saved_text.clear();
-        self.bom = false;
-        self.crlf = true;
-        self.input.update(cx, |state, cx| {
-            state.set_value("", window, cx);
-            state.focus(window, cx);
-        });
-        self.message = "新建文档".into();
+        self.active_tab = index;
+        self.input.update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
+    }
+
+    fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = Self::create_document(self.next_untitled_id, window, cx);
+        self.next_untitled_id += 1;
+        self.tabs.push(doc);
+        self.switch_tab(self.tabs.len() - 1, window, cx);
+        self.message = "新建文档".into();
+    }
+
+    fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let previous = self.active_tab;
+        self.switch_tab(index, window, cx);
+        if !self.confirm_discard(window, cx) {
+            self.switch_tab(previous, window, cx);
+            return;
+        }
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.new_file(&NewFile, window, cx);
+        } else {
+            let next = if previous == index {
+                index.min(self.tabs.len() - 1)
+            } else if previous > index {
+                previous - 1
+            } else {
+                previous
+            };
+            self.switch_tab(next, window, cx);
+        }
+        self.message = "标签已关闭".into();
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab_at(self.active_tab, window, cx);
+    }
+    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.switch_tab(
+            next_tab_index(self.active_tab, self.tabs.len(), true),
+            window,
+            cx,
+        );
+    }
+    fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.switch_tab(
+            next_tab_index(self.active_tab, self.tabs.len(), false),
+            window,
+            cx,
+        );
+    }
+    fn confirm_close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let previous = self.active_tab;
+        for index in 0..self.tabs.len() {
+            self.switch_tab(index, window, cx);
+            if !self.confirm_discard(window, cx) {
+                return false;
+            }
+        }
+        self.switch_tab(previous, window, cx);
+        true
+    }
+
+    fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("tab-bar")
+            .flex()
+            .w_full()
+            .min_w_0()
+            .overflow_x_scroll()
+            .bg(rgb(0x192233))
+            .border_b_1()
+            .border_color(rgb(0x303b50))
+            .children(self.tabs.iter().enumerate().map(|(index, doc)| {
+                let dirty = doc.input.read(cx).value().as_ref() != doc.saved_text;
+                let name = self.document_name(index);
+                div()
+                    .id(("document-tab", index))
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .cursor_pointer()
+                    .bg(rgb(if index == self.active_tab {
+                        0x30496b
+                    } else {
+                        0x192233
+                    }))
+                    .border_r_1()
+                    .border_color(rgb(0x303b50))
+                    .on_click(cx.listener(move |this, _, w, cx| this.switch_tab(index, w, cx)))
+                    .child(format!("{}{}", if dirty { "● " } else { "" }, name))
+                    .child(
+                        div()
+                            .id(("close-tab", index))
+                            .px_1()
+                            .rounded_sm()
+                            .hover(|s| s.bg(rgb(0x52617a)))
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                cx.stop_propagation();
+                                this.close_tab_at(index, w, cx);
+                            })),
+                    )
+            }))
     }
 
     fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -240,9 +411,9 @@ impl Editor {
                     ],
                 )
                 .add_filter("所有文件", &["*"])
-                .pick_file()
+                .pick_files()
         });
-        let path = match selected {
+        let paths = match selected {
             Ok(Some(path)) => path,
             Ok(None) => return,
             Err(err) => {
@@ -250,17 +421,30 @@ impl Editor {
                 return;
             }
         };
-        self.open_path(path, window, cx);
+        for path in paths {
+            self.open_path(path, window, cx);
+        }
     }
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let path = normalized_path(&path);
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.path.as_ref() == Some(&path))
+        {
+            self.switch_tab(index, window, cx);
+            return;
+        }
         let decoded = fs::read(&path)
             .map_err(|e| e.to_string())
             .and_then(|bytes| decode_text(&bytes));
         match decoded {
             Ok((text, crlf, bom)) => {
-                if !self.confirm_discard(window, cx) {
-                    return;
+                let reuse_blank =
+                    self.path.is_none() && self.saved_text.is_empty() && self.text(cx).is_empty();
+                if !reuse_blank {
+                    self.new_file(&NewFile, window, cx);
                 }
                 self.path = Some(path);
                 self.update_language(cx);
@@ -406,7 +590,7 @@ impl Editor {
                     .min_h_0()
                     .overflow_y_scroll()
                     .children(rows.into_iter().enumerate().map(|(index, (entry, depth))| {
-                        let active = self.path.as_ref() == Some(&entry.path);
+                        let active = self.path.as_ref() == Some(&normalized_path(&entry.path));
                         let expanded = self.expanded.contains(&entry.path);
                         let label = format!(
                             "{} {}",
@@ -558,12 +742,7 @@ fn tool(id: &'static str, label: &'static str) -> Stateful<Div> {
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dirty = self.dirty(cx);
-        let name = self
-            .path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or("未命名.txt".into());
+        let name = self.document_name(self.active_tab);
         window.set_window_title(&format!(
             "{}{} — Ferrite 文本编辑器",
             if dirty { "● " } else { "" },
@@ -586,6 +765,9 @@ impl Render for Editor {
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::toggle_tree))
             .on_action(cx.listener(Self::refresh_tree))
+            .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::next_tab))
+            .on_action(cx.listener(Self::previous_tab))
             .child(
                 div()
                     .flex()
@@ -626,37 +808,26 @@ impl Render for Editor {
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .px_4()
-                    .py_2()
-                    .text_sm()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_color(rgb(0x8bbcff))
-                            .child(if dirty { "●" } else { "○" }),
-                    )
-                    .child(name)
-                    .child(div().text_color(rgb(0x8796ad)).child(if dirty {
-                        "未保存"
-                    } else {
-                        "已同步"
-                    })),
-            )
-            .child(
-                div()
-                    .flex()
                     .flex_1()
                     .min_h_0()
                     .children(self.tree_visible.then(|| self.tree_panel(cx)))
                     .child(
-                        div().flex_1().min_w_0().h_full().px_3().pb_2().child(
-                            Input::new(&self.input)
-                                .h_full()
-                                .appearance(false)
-                                .font_family("Cascadia Code")
-                                .text_size(px(16.)),
-                        ),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.tab_bar(cx))
+                            .child(
+                                div().flex_1().min_h_0().px_3().pb_2().child(
+                                    Input::new(&self.input)
+                                        .h_full()
+                                        .appearance(false)
+                                        .font_family("Cascadia Code")
+                                        .text_size(px(16.)),
+                                ),
+                            ),
                     ),
             )
             .child(
@@ -684,10 +855,10 @@ impl Render for Editor {
 
 // Windows file associations pass the selected path as an OS-string argument.
 // Keep it lossless, including Unicode and spaces; quotes are handled by the OS.
-fn startup_path(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<PathBuf> {
+fn startup_paths(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<PathBuf> {
     args.into_iter()
         .skip(1)
-        .find(|arg| !arg.is_empty())
+        .filter(|arg| !arg.is_empty())
         .map(PathBuf::from)
         .map(|path| {
             if path.is_absolute() {
@@ -698,10 +869,16 @@ fn startup_path(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<Pa
                     .unwrap_or(path)
             }
         })
+        .collect()
+}
+
+#[cfg(test)]
+fn startup_path(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<PathBuf> {
+    startup_paths(args).into_iter().next()
 }
 
 fn main() {
-    let initial_path = startup_path(std::env::args_os());
+    let initial_paths = startup_paths(std::env::args_os());
     Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
@@ -712,6 +889,9 @@ fn main() {
             KeyBinding::new("ctrl-shift-s", SaveAs, None),
             KeyBinding::new("ctrl-shift-o", OpenFolder, None),
             KeyBinding::new("ctrl-b", ToggleTree, None),
+            KeyBinding::new("ctrl-w", CloseTab, None),
+            KeyBinding::new("ctrl-tab", NextTab, None),
+            KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
         ]);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -736,7 +916,7 @@ fn main() {
             move |window, cx| {
                 let editor = cx.new(|cx| {
                     let mut editor = Editor::new(window, cx);
-                    if let Some(path) = initial_path {
+                    for path in initial_paths {
                         let root = if path.is_dir() {
                             Some(path.clone())
                         } else {
@@ -760,7 +940,7 @@ fn main() {
                 });
                 let weak = editor.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {
-                    weak.update(cx, |editor, cx| editor.confirm_discard(window, cx))
+                    weak.update(cx, |editor, cx| editor.confirm_close_all(window, cx))
                         .unwrap_or(true)
                 });
                 cx.new(|cx| Root::new(editor, window, cx))
@@ -774,6 +954,22 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{decode_text, detect_language, encode_text};
+    #[test]
+    fn startup_accepts_multiple_files() {
+        let paths = super::startup_paths(["editor.exe".into(), "一.md".into(), "two.rs".into()]);
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("一.md"));
+        assert!(paths[1].ends_with("two.rs"));
+    }
+
+    #[test]
+    fn tab_cycle_wraps_in_both_directions() {
+        assert_eq!(super::next_tab_index(2, 3, true), 0);
+        assert_eq!(super::next_tab_index(0, 3, false), 2);
+        assert_eq!(super::next_tab_index(0, 1, false), 0);
+        assert_eq!(super::next_tab_index(0, 1, true), 0);
+    }
+
     #[test]
     fn startup_without_file_keeps_blank_document() {
         assert_eq!(super::startup_path(["editor.exe".into()]), None);
