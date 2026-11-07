@@ -43,6 +43,16 @@ fn native_dialog<T: Send + 'static>(
         .map_err(|_| "文件对话框意外退出，请重试。".to_string())
 }
 
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FlattenedTreeEntry {
+    path: PathBuf,
+    name: String,
+    directory: bool,
+    depth: usize,
+    expanded: bool,
+}
+
 #[derive(Clone)]
 struct TreeEntry {
     path: PathBuf,
@@ -74,6 +84,9 @@ struct Document {
     input: Entity<InputState>,
     path: Option<PathBuf>,
     saved_text: String,
+    dirty_cached: bool,
+    lines: usize,
+    chars: usize,
     crlf: bool,
     bom: bool,
     untitled_id: usize,
@@ -88,7 +101,8 @@ struct Editor {
     tree_cache: HashMap<PathBuf, Vec<TreeEntry>>,
     expanded: HashSet<PathBuf>,
     tree_visible: bool,
-    tree_scroll_handle: ScrollHandle,
+    tree_scroll_handle: UniformListScrollHandle,
+    flattened_tree: Vec<FlattenedTreeEntry>,
     scroll_tree_to_active: Cell<bool>,
     message: String,
 }
@@ -105,10 +119,27 @@ impl std::ops::DerefMut for Editor {
     }
 }
 
+// Compare Rope chunks without materializing the full document.
+fn text_matches_saved(input: &InputState, saved: &str) -> bool {
+    let rope = input.text();
+    if rope.len() != saved.len() {
+        return false;
+    }
+    let mut offset = 0;
+    for chunk in rope.chunks() {
+        if saved.as_bytes().get(offset..offset + chunk.len()) != Some(chunk.as_bytes()) {
+            return false;
+        }
+        offset += chunk.len();
+    }
+    true
+}
+
 fn normalized_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+#[cfg(test)]
 fn same_path(a: &Path, b: &Path) -> bool {
     normalized_path(a) == normalized_path(b)
 }
@@ -142,6 +173,7 @@ fn next_tab_index(active: usize, count: usize, forward: bool) -> usize {
 }
 
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn calculate_tree_scroll_offset(
     row_index: usize,
     total_rows: usize,
@@ -182,8 +214,14 @@ impl Editor {
                 .line_number(true)
                 .placeholder("开始输入，或按 Ctrl+O 打开文本文件…")
         });
-        let subscription = cx.subscribe_in(&input, window, |_, _, event, _, cx| {
+        let subscription = cx.subscribe_in(&input, window, |this, input, event, _, cx| {
             if matches!(event, InputEvent::Change) {
+                if let Some(doc) = this.tabs.iter_mut().find(|doc| doc.input == *input) {
+                    let state = input.read(cx);
+                    doc.dirty_cached = !text_matches_saved(state, &doc.saved_text);
+                    doc.lines = state.text().chunks().map(|chunk| chunk.bytes().filter(|b| *b == b'\n').count()).sum::<usize>() + 1;
+                    doc.chars = state.text().chunks().map(|chunk| chunk.chars().count()).sum();
+                }
                 cx.notify();
             }
         });
@@ -191,6 +229,9 @@ impl Editor {
             input,
             path: None,
             saved_text: String::new(),
+            dirty_cached: false,
+            lines: 1,
+            chars: 0,
             crlf: true,
             bom: false,
             untitled_id,
@@ -210,7 +251,7 @@ impl Editor {
                 tree_cache.insert(root.clone(), entries);
             }
         }
-        Self {
+        let mut editor = Self {
             tabs: vec![document],
             active_tab: 0,
             next_untitled_id: 2,
@@ -218,10 +259,13 @@ impl Editor {
             tree_cache,
             expanded: HashSet::new(),
             tree_visible: true,
-            tree_scroll_handle: ScrollHandle::new(),
+            tree_scroll_handle: UniformListScrollHandle::new(),
+            flattened_tree: Vec::new(),
             scroll_tree_to_active: Cell::new(true),
             message: "就绪".into(),
-        }
+        };
+        editor.rebuild_flattened_tree();
+        editor
     }
 
     fn reveal_active_in_tree(&mut self) {
@@ -232,13 +276,20 @@ impl Editor {
             return;
         };
         let ancestors = ancestor_dirs_under_root(&current_path, &root);
+        let mut changed = false;
         for dir in ancestors {
-            self.expanded.insert(dir.clone());
+            if self.expanded.insert(dir.clone()) {
+                changed = true;
+            }
             if !self.tree_cache.contains_key(&dir) {
                 if let Ok(entries) = read_directory(&dir) {
                     self.tree_cache.insert(dir, entries);
+                    changed = true;
                 }
             }
+        }
+        if changed || self.flattened_tree.is_empty() {
+            self.rebuild_flattened_tree();
         }
         self.scroll_tree_to_active.set(true);
     }
@@ -253,7 +304,7 @@ impl Editor {
         self.input.read(cx).value().to_string()
     }
     fn dirty(&self, cx: &App) -> bool {
-        self.text(cx) != self.saved_text
+        !text_matches_saved(self.input.read(cx), &self.saved_text)
     }
 
     fn error(&mut self, message: String, cx: &mut Context<Self>) {
@@ -321,6 +372,7 @@ impl Editor {
         self.path = Some(path);
         self.update_language(cx);
         self.saved_text = text;
+        self.dirty_cached = false;
         self.reveal_active_in_tree();
         self.message = "已保存".into();
         self.input.update(cx, |state, cx| state.focus(window, cx));
@@ -443,7 +495,7 @@ impl Editor {
             .border_b_1()
             .border_color(rgb(0x303b50))
             .children(self.tabs.iter().enumerate().map(|(index, doc)| {
-                let dirty = doc.input.read(cx).value().as_ref() != doc.saved_text;
+                let dirty = doc.dirty_cached;
                 let name = self.document_name(index);
                 div()
                     .id(("document-tab", index))
@@ -527,6 +579,9 @@ impl Editor {
                 }
                 self.path = Some(path);
                 self.update_language(cx);
+                self.lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
+                self.chars = text.chars().count();
+                self.dirty_cached = false;
                 self.saved_text = text.clone();
                 self.crlf = crlf;
                 self.bom = bom;
@@ -563,6 +618,7 @@ impl Editor {
                     }
                     self.tree_root = Some(root);
                     self.reveal_active_in_tree();
+                    self.rebuild_flattened_tree();
                     self.tree_visible = true;
                     self.message = "文件夹已打开".into();
                 }
@@ -597,6 +653,7 @@ impl Editor {
                 }
             }
         }
+        self.rebuild_flattened_tree();
         self.message = if errors.is_empty() {
             "文件树已刷新".into()
         } else {
@@ -605,22 +662,51 @@ impl Editor {
         cx.notify();
     }
 
-    fn tree_rows(&self, path: &Path, depth: usize, rows: &mut Vec<(TreeEntry, usize)>) {
+    fn rebuild_flattened_tree(&mut self) {
+        let mut rows = Vec::new();
+        if let Some(root) = &self.tree_root {
+            self.collect_flattened_tree(root, 0, &mut rows);
+        }
+        self.flattened_tree = rows;
+    }
+
+    fn collect_flattened_tree(&self, path: &Path, depth: usize, rows: &mut Vec<FlattenedTreeEntry>) {
         if let Some(entries) = self.tree_cache.get(path) {
             for entry in entries {
-                rows.push((entry.clone(), depth));
-                if entry.directory && self.expanded.contains(&entry.path) {
-                    self.tree_rows(&entry.path, depth + 1, rows);
+                let expanded = entry.directory && self.expanded.contains(&entry.path);
+                rows.push(FlattenedTreeEntry {
+                    path: entry.path.clone(),
+                    name: entry.name.clone(),
+                    directory: entry.directory,
+                    depth,
+                    expanded,
+                });
+                if expanded {
+                    self.collect_flattened_tree(&entry.path, depth + 1, rows);
                 }
             }
         }
     }
 
-    fn tree_panel(&self, cx: &mut Context<Self>) -> Div {
-        let mut rows = Vec::new();
-        if let Some(root) = &self.tree_root {
-            self.tree_rows(root, 0, &mut rows);
+    fn toggle_folder(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let path_buf = path.to_path_buf();
+        if self.expanded.remove(&path_buf) {
+            self.rebuild_flattened_tree();
+            cx.notify();
+            return;
         }
+        match read_directory(&path_buf) {
+            Ok(entries) => {
+                self.tree_cache.insert(path_buf.clone(), entries);
+                self.expanded.insert(path_buf);
+                self.rebuild_flattened_tree();
+            }
+            Err(err) => self.message = format!("无法读取目录：{err}"),
+        }
+        cx.notify();
+    }
+
+    fn tree_panel(&self, cx: &mut Context<Self>) -> Div {
         let root_name = self
             .tree_root
             .as_ref()
@@ -631,6 +717,18 @@ impl Editor {
                     .into_owned()
             })
             .unwrap_or("未打开文件夹".into());
+
+        let active_path = self.path.clone();
+        if self.scroll_tree_to_active.take() {
+            if let Some(target_index) = self.flattened_tree.iter().position(|entry| {
+                active_path.as_ref() == Some(&entry.path)
+            }) {
+                self.tree_scroll_handle.scroll_to_item(target_index, ScrollStrategy::Center);
+            }
+        }
+
+        let count = self.flattened_tree.len();
+
         div()
             .w(px(250.))
             .h_full()
@@ -669,80 +767,65 @@ impl Editor {
                     .overflow_hidden()
                     .child(root_name),
             )
-            .child({
-                let active_row_index = rows.iter().position(|(entry, _)| {
-                    self.path.as_ref().map_or(false, |p| same_path(p, &entry.path))
-                });
-                if self.scroll_tree_to_active.take() {
-                    if let Some(target_index) = active_row_index {
-                        let viewport_h = f32::from(self.tree_scroll_handle.bounds().size.height);
-                        let current_offset_y = f32::from(self.tree_scroll_handle.offset().y);
-                        const ROW_HEIGHT: f32 = 28.0;
-
-                        if viewport_h > 0.0 {
-                            if let Some(target_y) = calculate_tree_scroll_offset(
-                                target_index,
-                                rows.len(),
-                                ROW_HEIGHT,
-                                viewport_h,
-                                current_offset_y,
-                            ) {
-                                self.tree_scroll_handle
-                                    .set_offset(Point::new(px(0.), px(target_y)));
-                            }
-                        }
-                        self.tree_scroll_handle.scroll_to_item(target_index);
-                    }
-                }
+            .child(
                 div()
-                    .id("file-tree-scroll")
-                    .track_scroll(&self.tree_scroll_handle)
+                    .id("file-tree-container")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .children(rows.into_iter().enumerate().map(|(index, (entry, depth))| {
-                        let active = self.path.as_ref().map_or(false, |p| same_path(p, &entry.path));
-                        let expanded = self.expanded.contains(&entry.path);
-                        let label = format!(
-                            "{} {}",
-                            if entry.directory {
-                                if expanded { "▾" } else { "▸" }
-                            } else {
-                                "·"
-                            },
-                            entry.name
-                        );
-                        div()
-                            .id(("file-tree-row", index))
-                            .pl(px(12. + depth as f32 * 16.))
-                            .pr_2()
-                            .py_1()
-                            .text_sm()
-                            .cursor_pointer()
-                            .overflow_hidden()
-                            .bg(rgb(if active { 0x30496b } else { 0x192233 }))
-                            .hover(|style| style.bg(rgb(0x293a53)))
-                            .child(label)
-                            .on_click(cx.listener(move |this, _, w, cx| {
-                                if entry.directory {
-                                    if this.expanded.remove(&entry.path) {
-                                        cx.notify();
-                                        return;
-                                    }
-                                    match read_directory(&entry.path) {
-                                        Ok(entries) => {
-                                            this.tree_cache.insert(entry.path.clone(), entries);
-                                            this.expanded.insert(entry.path.clone());
-                                        }
-                                        Err(err) => this.message = format!("无法读取目录：{err}"),
-                                    }
-                                    cx.notify();
-                                } else {
-                                    this.open_path(entry.path.clone(), w, cx);
+                    .overflow_hidden()
+                    .child(
+                        uniform_list(
+                            "file-tree-list",
+                            count,
+                            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                                let mut items = Vec::with_capacity(range.len());
+                                for index in range {
+                                    let Some(entry) = this.flattened_tree.get(index) else {
+                                        continue;
+                                    };
+                                    let active = this.path.as_ref() == Some(&entry.path);
+                                    let is_dir = entry.directory;
+                                    let expanded = entry.expanded;
+                                    let entry_path = entry.path.clone();
+                                    let label = format!(
+                                        "{} {}",
+                                        if is_dir {
+                                            if expanded { "▾" } else { "▸" }
+                                        } else {
+                                            "·"
+                                        },
+                                        entry.name
+                                    );
+
+                                    items.push(
+                                        div()
+                                            .id(("file-tree-row", index))
+                                            .h(px(28.))
+                                            .line_height(px(28.))
+                                            .pl(px(12. + entry.depth as f32 * 16.))
+                                            .pr_2()
+                                            .text_sm()
+                                            .cursor_pointer()
+                                            .overflow_hidden()
+                                            .bg(rgb(if active { 0x30496b } else { 0x192233 }))
+                                            .hover(|style| style.bg(rgb(0x293a53)))
+                                            .child(label)
+                                            .on_click(cx.listener(move |this, _, w, cx| {
+                                                if is_dir {
+                                                    this.toggle_folder(&entry_path, cx);
+                                                } else {
+                                                    this.open_path(entry_path.clone(), w, cx);
+                                                }
+                                            })),
+                                    );
                                 }
-                            }))
-                    }))
-            })
+                                items
+                            }),
+                        )
+                        .track_scroll(self.tree_scroll_handle.clone())
+                        .size_full(),
+                    ),
+            )
     }
 
     fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -852,16 +935,15 @@ fn tool(id: &'static str, label: &'static str) -> Stateful<Div> {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let dirty = self.dirty(cx);
+        let dirty = self.dirty_cached;
         let name = self.document_name(self.active_tab);
         window.set_window_title(&format!(
             "{}{} — Ferrite 文本编辑器",
             if dirty { "● " } else { "" },
             name
         ));
-        let value = self.input.read(cx).value();
-        let lines = value.bytes().filter(|b| *b == b'\n').count() + 1;
-        let chars = value.chars().count();
+        let lines = self.lines;
+        let chars = self.chars;
         div()
             .size_full()
             .flex()
@@ -1316,6 +1398,77 @@ mod tests {
             calculate_tree_scroll_offset(59, TOTAL_ROWS, ROW_HEIGHT, VIEWPORT_H, 0.0),
             Some(-max_scroll)
         );
+    }
+
+
+    #[test]
+    fn flattened_tree_cache_and_virtualization() {
+        let temp_dir = std::env::var_os("FEIBO_TMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("flattened-tree-test-{}", std::process::id()));
+        let dir_a = temp_dir.join("folder_a");
+        let dir_b = temp_dir.join("folder_b");
+        let sub_dir = dir_a.join("sub_folder");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_a.join("file_1.txt"), "1").unwrap();
+        std::fs::write(sub_dir.join("sub_file.txt"), "sub").unwrap();
+        std::fs::write(dir_b.join("file_2.txt"), "2").unwrap();
+
+        let norm_root = super::normalized_path(&temp_dir);
+        let entries = super::read_directory(&norm_root).unwrap();
+        let mut tree_cache = std::collections::HashMap::new();
+        tree_cache.insert(norm_root.clone(), entries);
+
+        let mut expanded = std::collections::HashSet::new();
+        // 初始折叠
+        let norm_dir_a = super::normalized_path(&dir_a);
+        let _norm_dir_b = super::normalized_path(&dir_b);
+        let _norm_sub_dir = super::normalized_path(&sub_dir);
+
+        // 模拟 collect
+        let collect = |cache: &std::collections::HashMap<std::path::PathBuf, Vec<super::TreeEntry>>,
+                       exp: &std::collections::HashSet<std::path::PathBuf>,
+                       root: &std::path::Path| {
+            let mut result = Vec::new();
+            fn rec(
+                path: &std::path::Path,
+                depth: usize,
+                cache: &std::collections::HashMap<std::path::PathBuf, Vec<super::TreeEntry>>,
+                exp: &std::collections::HashSet<std::path::PathBuf>,
+                out: &mut Vec<super::FlattenedTreeEntry>,
+            ) {
+                if let Some(entries) = cache.get(path) {
+                    for e in entries {
+                        let is_exp = e.directory && exp.contains(&e.path);
+                        out.push(super::FlattenedTreeEntry {
+                            path: e.path.clone(),
+                            name: e.name.clone(),
+                            directory: e.directory,
+                            depth,
+                            expanded: is_exp,
+                        });
+                        if is_exp {
+                            rec(&e.path, depth + 1, cache, exp, out);
+                        }
+                    }
+                }
+            }
+            rec(root, 0, cache, exp, &mut result);
+            result
+        };
+
+        let initial_rows = collect(&tree_cache, &expanded, &norm_root);
+        assert_eq!(initial_rows.len(), 2); // 两个文件夹 folder_a 和 folder_b
+
+        // 展开 folder_a
+        expanded.insert(norm_dir_a.clone());
+        tree_cache.insert(norm_dir_a.clone(), super::read_directory(&norm_dir_a).unwrap());
+        let expanded_rows = collect(&tree_cache, &expanded, &norm_root);
+        assert_eq!(expanded_rows.len(), 4); // folder_a, file_1.txt, sub_folder, folder_b
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

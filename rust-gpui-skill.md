@@ -325,3 +325,12 @@ gpui-component = { version = "=0.5.0", features = ["tree-sitter-languages"] }
 5. **双保险兜底**：
    - 计算偏移后通过 `set_offset(Point::new(px(0.), px(target_y)))` 立即更新视口。
    - 同步调用 GPUI 原生的 `self.tree_scroll_handle.scroll_to_item(target_index)`，确保即使初次展开视口 bounds 尚未测量的首帧，GPUI 渲染管线也能将目标项目精准呈现于可视区中。
+
+
+## 9. 卡顿排查：渲染热路径与 Rope 接口
+
+2026-11-08：检查发现资源管理器每次构建界面都逐项调用 `same_path`，间接执行两次 `fs::canonicalize`。改为直接比较从规范化根目录生成的路径，磁盘规范化只在打开文件、建立根目录和目录联动时进行。不要在渲染循环里执行同步文件系统查询。
+
+`gpui-component 0.5.0` 的 `InputState::value()` 虽然返回 `SharedString`，实现中仍会执行 `self.text.to_string()`，不能把返回类型当成零拷贝保证。改用 `text()` 获取 Rope，分块比较已保存文本；缓存每个文档的未保存状态、行数和字符数，在 `InputEvent::Change` 中更新，加载和保存时同步更新。渲染只读取缓存。关闭前实时按 Rope 分块核对，撤销回原文仍应恢复未修改状态。
+
+范围限制：文件树仍构建所有展开行，并未实现可视行虚拟化；大文件编辑、目录读取和原生对话框等待仍可能占用 UI 时间。当前产物沿用 debug 构建；未测量具体帧率、延迟和加速倍数，不把优化方案等同于实测流畅性。
