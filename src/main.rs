@@ -7,6 +7,7 @@ use gpui_component::{
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
@@ -87,6 +88,8 @@ struct Editor {
     tree_cache: HashMap<PathBuf, Vec<TreeEntry>>,
     expanded: HashSet<PathBuf>,
     tree_visible: bool,
+    tree_scroll_handle: ScrollHandle,
+    scroll_tree_to_active: Cell<bool>,
     message: String,
 }
 
@@ -138,6 +141,35 @@ fn next_tab_index(active: usize, count: usize, forward: bool) -> usize {
     }
 }
 
+
+fn calculate_tree_scroll_offset(
+    row_index: usize,
+    total_rows: usize,
+    row_height: f32,
+    viewport_height: f32,
+    current_offset_y: f32,
+) -> Option<f32> {
+    if viewport_height <= 0.0 || total_rows == 0 {
+        return None;
+    }
+    let content_height = total_rows as f32 * row_height;
+    let max_scroll = (content_height - viewport_height).max(0.0);
+    let item_top_in_content = row_index as f32 * row_height;
+    let item_bottom_in_content = item_top_in_content + row_height;
+
+    let item_top_in_viewport = item_top_in_content + current_offset_y;
+    let item_bottom_in_viewport = item_bottom_in_content + current_offset_y;
+
+    let margin = row_height * 1.5;
+    if item_top_in_viewport >= margin && item_bottom_in_viewport <= (viewport_height - margin) {
+        return None;
+    }
+
+    let ideal_offset_y = (viewport_height - row_height) / 2.0 - item_top_in_content;
+    let target_offset_y = ideal_offset_y.clamp(-max_scroll, 0.0);
+    Some(target_offset_y)
+}
+
 impl Editor {
     fn create_document(
         untitled_id: usize,
@@ -186,6 +218,8 @@ impl Editor {
             tree_cache,
             expanded: HashSet::new(),
             tree_visible: true,
+            tree_scroll_handle: ScrollHandle::new(),
+            scroll_tree_to_active: Cell::new(true),
             message: "就绪".into(),
         }
     }
@@ -206,6 +240,7 @@ impl Editor {
                 }
             }
         }
+        self.scroll_tree_to_active.set(true);
     }
 
     fn update_language(&mut self, cx: &mut Context<Self>) {
@@ -634,9 +669,34 @@ impl Editor {
                     .overflow_hidden()
                     .child(root_name),
             )
-            .child(
+            .child({
+                let active_row_index = rows.iter().position(|(entry, _)| {
+                    self.path.as_ref().map_or(false, |p| same_path(p, &entry.path))
+                });
+                if self.scroll_tree_to_active.take() {
+                    if let Some(target_index) = active_row_index {
+                        let viewport_h = f32::from(self.tree_scroll_handle.bounds().size.height);
+                        let current_offset_y = f32::from(self.tree_scroll_handle.offset().y);
+                        const ROW_HEIGHT: f32 = 28.0;
+
+                        if viewport_h > 0.0 {
+                            if let Some(target_y) = calculate_tree_scroll_offset(
+                                target_index,
+                                rows.len(),
+                                ROW_HEIGHT,
+                                viewport_h,
+                                current_offset_y,
+                            ) {
+                                self.tree_scroll_handle
+                                    .set_offset(Point::new(px(0.), px(target_y)));
+                            }
+                        }
+                        self.tree_scroll_handle.scroll_to_item(target_index);
+                    }
+                }
                 div()
                     .id("file-tree-scroll")
+                    .track_scroll(&self.tree_scroll_handle)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -681,8 +741,8 @@ impl Editor {
                                     this.open_path(entry.path.clone(), w, cx);
                                 }
                             }))
-                    })),
-            )
+                    }))
+            })
     }
 
     fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -1006,7 +1066,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_text, detect_language, encode_text};
+    use super::{calculate_tree_scroll_offset, decode_text, detect_language, encode_text};
     #[test]
     fn startup_accepts_multiple_files() {
         let paths = super::startup_paths(["editor.exe".into(), "一.md".into(), "two.rs".into()]);
@@ -1221,6 +1281,41 @@ mod tests {
                 "语言 {lang} 应该能够成功载入 Tree-sitter 语法解析器"
             );
         }
+    }
+
+        #[test]
+    fn tree_scroll_offset_centers_out_of_view_row_and_keeps_in_view_stable() {
+        const ROW_HEIGHT: f32 = 28.0;
+        const VIEWPORT_H: f32 = 600.0;
+        const TOTAL_ROWS: usize = 60;
+
+        // 位于视口中央偏上的第 5 行，当前已在可视区内且上下均有余量，无需重置滚动条
+        assert_eq!(
+            calculate_tree_scroll_offset(5, TOTAL_ROWS, ROW_HEIGHT, VIEWPORT_H, 0.0),
+            None
+        );
+
+        // 位于深处的第 45 行，超出视口下方，应返回居中偏移量
+        let offset = calculate_tree_scroll_offset(45, TOTAL_ROWS, ROW_HEIGHT, VIEWPORT_H, 0.0);
+        assert!(offset.is_some());
+        let offset_y = offset.unwrap();
+        assert!(offset_y < 0.0);
+        // 目标行中心在经过偏移后应恰好对齐视口中央
+        let row_center_in_viewport = (45.0 * ROW_HEIGHT + ROW_HEIGHT / 2.0) + offset_y;
+        assert!((row_center_in_viewport - VIEWPORT_H / 2.0).abs() < 1.0);
+
+        // 位于第 0 行时从下方跳回，理想居中偏上，但经过上边界 clamp 限制为 0.0（顶格不留白）
+        assert_eq!(
+            calculate_tree_scroll_offset(0, TOTAL_ROWS, ROW_HEIGHT, VIEWPORT_H, -800.0),
+            Some(0.0)
+        );
+
+        // 位于最后一行时，应受限于最大滚动范围（底格不留白）
+        let max_scroll = (TOTAL_ROWS as f32 * ROW_HEIGHT) - VIEWPORT_H;
+        assert_eq!(
+            calculate_tree_scroll_offset(59, TOTAL_ROWS, ROW_HEIGHT, VIEWPORT_H, 0.0),
+            Some(-max_scroll)
+        );
     }
 
     #[test]

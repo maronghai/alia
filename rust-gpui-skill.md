@@ -272,6 +272,56 @@ gpui-component = { version = "=0.5.0", features = ["tree-sitter-languages"] }
   - **Piece Table（如 VS Code）**：原始只读缓冲 + 追加缓冲，由双向链表或红黑树维护片段索引，内存紧凑且天然支持无限撤销。
 
 
-## Tab 与资源管理器联动
+## 8. 资源管理器海量项与 Tab 联动滚动实战经验
 
-切换标签、打开文件及保存后，自动展开当前工作区内文件的祖先目录，并按需填充目录缓存，沿用当前文件高亮。未命名文档及工作区外文件保持文件树根目录不变。树根目录统一使用 canonicalize 的路径格式，保留 Windows 长路径和网络共享前缀，不通过字符串截断前缀。当前实现未增加自动滚动定位。
+### 8.1 核心痛点与问题本质
+当项目文件规模扩大（深层目录、数十乃至数百个文件）时，资源管理器出现纵向滚动条。
+如果仅展开目录和高亮当前文件，被高亮的文件很可能位于视口之外（在最上方或最下方），用户切换 Tab 后在资源管理器视窗内看不到当前文件。
+如果在每帧重绘时无脑将当前文件拉回中央，又会导致用户在代码区打字输入或者手动滚轮查看侧边栏时，滚动条被强制跳回，极大伤害交互体验。
+
+### 8.2 GPUI `ScrollHandle` 核心技术要点
+1. **`ScrollHandle` 的数据通道**：
+   - GPUI 的 `ScrollHandle` 底层为 `Rc<RefCell<ScrollHandleState>>`，内部包含 `offset: Point<Pixels>`、`bounds: Bounds<Pixels>` 与 `child_bounds: Vec<Bounds<Pixels>>`。
+   - 必须通过 `.track_scroll(&self.tree_scroll_handle)` 绑定在带有 `.overflow_y_scroll()` 的容器上，GPUI 才能在 prepaint 阶段捕获布局并响应滚动。
+2. **`Pixels` 类型安全与转换**：
+   - GPUI 的 `Pixels` 是 tuple struct `Pixels(pub(crate) f32)`，其内部字段是私有的。直接访问 `.0` 会触发 `E0616` 编译错误。
+   - 正确转换方式是使用 `f32::from(pixels)` 或 `f32::from(&pixels)`。
+3. **视口舒适区防抖与垂直居中算法**：
+   ```rust
+   fn calculate_tree_scroll_offset(
+       row_index: usize,
+       total_rows: usize,
+       row_height: f32,
+       viewport_height: f32,
+       current_offset_y: f32,
+   ) -> Option<f32> {
+       if viewport_height <= 0.0 || total_rows == 0 {
+           return None;
+       }
+       let content_height = total_rows as f32 * row_height;
+       let max_scroll = (content_height - viewport_height).max(0.0);
+       let item_top_in_content = row_index as f32 * row_height;
+       let item_bottom_in_content = item_top_in_content + row_height;
+
+       let item_top_in_viewport = item_top_in_content + current_offset_y;
+       let item_bottom_in_viewport = item_bottom_in_content + current_offset_y;
+
+       // 上下预留 1.5 行高（约 42px）舒适余量，若已在视口舒适区内，则保持原样不跳动
+       let margin = row_height * 1.5;
+       if item_top_in_viewport >= margin && item_bottom_in_viewport <= (viewport_height - margin) {
+           return None;
+       }
+
+       // 否则将目标行垂直中心对齐视口中心，并限制上下边界防止露白
+       let ideal_offset_y = (viewport_height - row_height) / 2.0 - item_top_in_content;
+       let target_offset_y = ideal_offset_y.clamp(-max_scroll, 0.0);
+       Some(target_offset_y)
+   }
+   ```
+4. **`Cell<bool>` 延迟单次消费模式**：
+   - 在 `Editor` 中维护 `scroll_tree_to_active: Cell<bool>`。
+   - 仅在切换 Tab（点击、快捷键、关闭）、打开文件、保存/另存为时置为 `true`。
+   - 在 `tree_panel` 视图渲染时通过 `self.scroll_tree_to_active.take()` 单次消费并执行定位，彻底避免日常编辑与滚轮浏览被打扰。
+5. **双保险兜底**：
+   - 计算偏移后通过 `set_offset(Point::new(px(0.), px(target_y)))` 立即更新视口。
+   - 同步调用 GPUI 原生的 `self.tree_scroll_handle.scroll_to_item(target_index)`，确保即使初次展开视口 bounds 尚未测量的首帧，GPUI 渲染管线也能将目标项目精准呈现于可视区中。
