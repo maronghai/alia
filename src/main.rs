@@ -106,6 +106,30 @@ fn normalized_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn same_path(a: &Path, b: &Path) -> bool {
+    normalized_path(a) == normalized_path(b)
+}
+
+fn ancestor_dirs_under_root(child: &Path, root: &Path) -> Vec<PathBuf> {
+    let norm_child = normalized_path(child);
+    let norm_root = normalized_path(root);
+
+    let Ok(rel) = norm_child.strip_prefix(&norm_root) else {
+        return Vec::new();
+    };
+
+    let mut ancestors = Vec::new();
+    let mut current = norm_root;
+    let components: Vec<_> = rel.components().collect();
+    if components.len() > 1 {
+        for component in &components[..components.len() - 1] {
+            current = current.join(component);
+            ancestors.push(current.clone());
+        }
+    }
+    ancestors
+}
+
 fn next_tab_index(active: usize, count: usize, forward: bool) -> usize {
     if forward {
         (active + 1) % count
@@ -147,7 +171,7 @@ impl Editor {
         document
             .input
             .update(cx, |state, cx| state.focus(window, cx));
-        let tree_root = std::env::current_dir().ok();
+        let tree_root = std::env::current_dir().ok().map(|p| normalized_path(&p));
         let mut tree_cache = HashMap::new();
         if let Some(root) = &tree_root {
             if let Ok(entries) = read_directory(root) {
@@ -163,6 +187,24 @@ impl Editor {
             expanded: HashSet::new(),
             tree_visible: true,
             message: "就绪".into(),
+        }
+    }
+
+    fn reveal_active_in_tree(&mut self) {
+        let Some(current_path) = self.path.clone() else {
+            return;
+        };
+        let Some(root) = self.tree_root.clone() else {
+            return;
+        };
+        let ancestors = ancestor_dirs_under_root(&current_path, &root);
+        for dir in ancestors {
+            self.expanded.insert(dir.clone());
+            if !self.tree_cache.contains_key(&dir) {
+                if let Ok(entries) = read_directory(&dir) {
+                    self.tree_cache.insert(dir, entries);
+                }
+            }
         }
     }
 
@@ -244,6 +286,7 @@ impl Editor {
         self.path = Some(path);
         self.update_language(cx);
         self.saved_text = text;
+        self.reveal_active_in_tree();
         self.message = "已保存".into();
         self.input.update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
@@ -289,6 +332,7 @@ impl Editor {
         }
         self.active_tab = index;
         self.input.update(cx, |state, cx| state.focus(window, cx));
+        self.reveal_active_in_tree();
         cx.notify();
     }
 
@@ -455,6 +499,7 @@ impl Editor {
                     state.set_value(text, window, cx);
                     state.focus(window, cx);
                 });
+                self.reveal_active_in_tree();
                 self.message = "文件已打开".into();
                 cx.notify();
             }
@@ -473,10 +518,16 @@ impl Editor {
         }) {
             Ok(Some(root)) => match read_directory(&root) {
                 Ok(entries) => {
+                    let root = normalized_path(&root);
                     self.tree_cache.clear();
                     self.expanded.clear();
-                    self.tree_cache.insert(root.clone(), entries);
+                    if let Ok(entries) = read_directory(&root) {
+                        self.tree_cache.insert(root.clone(), entries);
+                    } else {
+                        self.tree_cache.insert(root.clone(), entries);
+                    }
                     self.tree_root = Some(root);
+                    self.reveal_active_in_tree();
                     self.tree_visible = true;
                     self.message = "文件夹已打开".into();
                 }
@@ -590,7 +641,7 @@ impl Editor {
                     .min_h_0()
                     .overflow_y_scroll()
                     .children(rows.into_iter().enumerate().map(|(index, (entry, depth))| {
-                        let active = self.path.as_ref() == Some(&normalized_path(&entry.path));
+                        let active = self.path.as_ref().map_or(false, |p| same_path(p, &entry.path));
                         let expanded = self.expanded.contains(&entry.path);
                         let label = format!(
                             "{} {}",
@@ -923,6 +974,7 @@ fn main() {
                             path.parent().map(Path::to_path_buf)
                         };
                         if let Some(root) = root {
+                            let root = normalized_path(&root);
                             editor.tree_cache.clear();
                             editor.expanded.clear();
                             if let Ok(entries) = read_directory(&root) {
@@ -936,6 +988,7 @@ fn main() {
                             editor.open_path(path, window, cx);
                         }
                     }
+                    editor.reveal_active_in_tree();
                     editor
                 });
                 let weak = editor.downgrade();
@@ -1043,6 +1096,63 @@ mod tests {
         let caller = std::thread::current().id();
         let worker = super::native_dialog(|| std::thread::current().id()).unwrap();
         assert_ne!(caller, worker);
+    }
+
+    #[test]
+    fn ancestor_dirs_under_root_returns_correct_hierarchy() {
+        let root = std::path::Path::new(r"C:\project");
+        let child = std::path::Path::new(r"C:\project\src\nested\mod.rs");
+        let ancestors = super::ancestor_dirs_under_root(child, root);
+        assert_eq!(ancestors.len(), 2);
+        assert!(ancestors[0].ends_with("src"));
+        assert!(ancestors[1].ends_with("nested"));
+    }
+
+    #[test]
+    fn ancestor_dirs_outside_root_returns_empty() {
+        let root = std::path::Path::new(r"C:\project");
+        let child = std::path::Path::new(r"D:\other\file.txt");
+        let ancestors = super::ancestor_dirs_under_root(child, root);
+        assert!(ancestors.is_empty());
+    }
+
+    #[test]
+    fn same_path_ignores_unc_prefix() {
+        let p1 = std::env::current_dir().unwrap();
+        let p2 = std::fs::canonicalize(&p1).unwrap();
+        assert!(super::same_path(&p1, &p2));
+    }
+
+    #[test]
+    fn tree_ancestors_expansion_populates_intermediate_caches() {
+        let temp_dir = std::env::var_os("FEIBO_TMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("editor-tree-test-{}", std::process::id()));
+        let sub = temp_dir.join("level1").join("level2");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("doc.txt");
+        std::fs::write(&file, "test").unwrap();
+
+        let ancestors = super::ancestor_dirs_under_root(&file, &temp_dir);
+        assert_eq!(ancestors.len(), 2);
+        let mut expanded = std::collections::HashSet::new();
+        let mut tree_cache = std::collections::HashMap::new();
+
+        for dir in &ancestors {
+            expanded.insert(dir.clone());
+            if !tree_cache.contains_key(dir) {
+                if let Ok(entries) = super::read_directory(dir) {
+                    tree_cache.insert(dir.clone(), entries);
+                }
+            }
+        }
+
+        assert!(expanded.iter().any(|p| super::same_path(p, &temp_dir.join("level1"))));
+        assert!(expanded.iter().any(|p| super::same_path(p, &temp_dir.join("level1").join("level2"))));
+        assert!(tree_cache.contains_key(&ancestors[0]));
+        assert!(tree_cache.contains_key(&ancestors[1]));
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
