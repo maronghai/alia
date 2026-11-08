@@ -255,6 +255,56 @@ pub fn minimap_segments(text: &str) -> Vec<(f32, f32, u32)> {
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseTabsKind {
+    All,
+    Others,
+    Right,
+    Left,
+}
+
+pub fn calculate_tabs_to_close_indices(
+    kind: CloseTabsKind,
+    target_index: usize,
+    total_tabs: usize,
+) -> Vec<usize> {
+    match kind {
+        CloseTabsKind::All => (0..total_tabs).rev().collect(),
+        CloseTabsKind::Others => {
+            let mut indices = Vec::new();
+            if target_index < total_tabs {
+                for i in (target_index + 1..total_tabs).rev() {
+                    indices.push(i);
+                }
+                for i in (0..target_index).rev() {
+                    indices.push(i);
+                }
+            }
+            indices
+        }
+        CloseTabsKind::Right => {
+            if target_index + 1 < total_tabs {
+                (target_index + 1..total_tabs).rev().collect()
+            } else {
+                Vec::new()
+            }
+        }
+        CloseTabsKind::Left => {
+            if target_index < total_tabs {
+                (0..target_index).rev().collect()
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TabContextMenu {
+    tab_index: usize,
+    position: Point<Pixels>,
+}
+
 struct Editor {
     tabs: Vec<Document>,
     active_tab: usize,
@@ -271,6 +321,7 @@ struct Editor {
     scroll_tree_to_active: Cell<bool>,
     message: String,
     last_window_title: String,
+    tab_context_menu: Option<TabContextMenu>,
 }
 
 impl std::ops::Deref for Editor {
@@ -435,6 +486,7 @@ impl Editor {
             scroll_tree_to_active: Cell::new(true),
             message: "Ready".into(),
             last_window_title: String::new(),
+            tab_context_menu: None,
         };
         editor.rebuild_flattened_tree();
         editor
@@ -604,12 +656,15 @@ impl Editor {
         self.message = "New document".into();
     }
 
-    fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if index >= self.tabs.len() {
+            return false;
+        }
         let previous = self.active_tab;
         self.switch_tab(index, window, cx);
         if !self.confirm_discard(window, cx) {
             self.switch_tab(previous, window, cx);
-            return;
+            return false;
         }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -626,6 +681,46 @@ impl Editor {
         }
         self.message = "Tab closed".into();
         cx.notify();
+        true
+    }
+
+    fn open_tab_context_menu(
+        &mut self,
+        index: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index < self.tabs.len() {
+            self.switch_tab(index, window, cx);
+            self.tab_context_menu = Some(TabContextMenu {
+                tab_index: index,
+                position,
+            });
+            cx.notify();
+        }
+    }
+
+    fn batch_close_tabs(
+        &mut self,
+        kind: CloseTabsKind,
+        target_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_context_menu = None;
+        let indices = calculate_tabs_to_close_indices(kind, target_index, self.tabs.len());
+        for index in indices {
+            if index < self.tabs.len() {
+                if !self.close_tab_at(index, window, cx) {
+                    break;
+                }
+            }
+        }
+        if !self.tabs.is_empty() {
+            let active = self.active_tab.min(self.tabs.len() - 1);
+            self.switch_tab(active, window, cx);
+        }
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -694,6 +789,12 @@ impl Editor {
                     .border_r_1()
                     .border_color(rgb(0x232838))
                     .on_click(cx.listener(move |this, _, w, cx| this.switch_tab(index, w, cx)))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, w, cx| {
+                            this.open_tab_context_menu(index, event.position, w, cx);
+                        }),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -715,6 +816,176 @@ impl Editor {
                             })),
                     )
             }))
+    }
+
+    fn context_menu_item(
+        &self,
+        id_name: &'static str,
+        label: &'static str,
+        enabled: bool,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        if enabled {
+            let action = std::rc::Rc::new(action);
+            let action_down = action.clone();
+            let action_click = action;
+            div()
+                .id(id_name)
+                .px_3()
+                .py_1p5()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_color(rgb(0xe2e8f0))
+                .hover(|s| s.bg(rgb(0x2a3244)).text_color(rgb(0xffffff)))
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, w, cx| {
+                        cx.stop_propagation();
+                        action_down(this, w, cx);
+                    }),
+                )
+                .on_click(cx.listener(move |this, _, w, cx| {
+                    cx.stop_propagation();
+                    action_click(this, w, cx);
+                }))
+        } else {
+            div()
+                .id(id_name)
+                .px_3()
+                .py_1p5()
+                .rounded(px(4.))
+                .text_color(rgb(0x56617a))
+                .cursor_not_allowed()
+                .child(label)
+        }
+    }
+
+    fn tab_context_menu_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let menu = match &self.tab_context_menu {
+            Some(m) => m.clone(),
+            None => return div().into_any_element(),
+        };
+        let target_index = menu.tab_index;
+        let total_tabs = self.tabs.len();
+        let has_left = target_index > 0;
+        let has_right = target_index + 1 < total_tabs;
+        let has_others = total_tabs > 1;
+
+        let menu_width = px(200.);
+        let menu_height = px(180.);
+        let window_size = window.bounds().size;
+        let pos_x = if menu.position.x + menu_width > window_size.width {
+            (window_size.width - menu_width - px(8.)).max(px(0.))
+        } else {
+            menu.position.x
+        };
+        let pos_y = if menu.position.y + menu_height > window_size.height {
+            (window_size.height - menu_height - px(8.)).max(px(0.))
+        } else {
+            menu.position.y
+        };
+
+        deferred(
+            anchored().child(
+                div()
+                    .id("context-menu-layer")
+                    .absolute()
+                    .size_full()
+                    .top_0()
+                    .left_0()
+                    .child(
+                        div()
+                            .id("context-menu-backdrop")
+                            .size_full()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.tab_context_menu = None;
+                                cx.notify();
+                            }))
+                            .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                                this.tab_context_menu = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("tab-context-menu-popup")
+                            .occlude()
+                            .absolute()
+                            .left(pos_x)
+                            .top(pos_y)
+                            .w(menu_width)
+                            .bg(rgb(0x1a1e28))
+                            .border_1()
+                            .border_color(rgb(0x323a4e))
+                            .rounded(px(6.))
+                            .shadow_lg()
+                            .p_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .text_sm()
+                            .child(self.context_menu_item(
+                                "menu-close-tab",
+                                "Close Tab",
+                                true,
+                                move |this, w, cx| {
+                                    this.tab_context_menu = None;
+                                    this.close_tab_at(target_index, w, cx);
+                                },
+                                cx,
+                            ))
+                            .child(self.context_menu_item(
+                                "menu-close-others",
+                                "Close Other Tabs",
+                                has_others,
+                                move |this, w, cx| {
+                                    this.batch_close_tabs(CloseTabsKind::Others, target_index, w, cx);
+                                },
+                                cx,
+                            ))
+                            .child(self.context_menu_item(
+                                "menu-close-right",
+                                "Close Tabs to the Right",
+                                has_right,
+                                move |this, w, cx| {
+                                    this.batch_close_tabs(CloseTabsKind::Right, target_index, w, cx);
+                                },
+                                cx,
+                            ))
+                            .child(self.context_menu_item(
+                                "menu-close-left",
+                                "Close Tabs to the Left",
+                                has_left,
+                                move |this, w, cx| {
+                                    this.batch_close_tabs(CloseTabsKind::Left, target_index, w, cx);
+                                },
+                                cx,
+                            ))
+                            .child(
+                                div()
+                                    .h(px(1.))
+                                    .bg(rgb(0x283042))
+                                    .my_1()
+                                    .mx_1(),
+                            )
+                            .child(self.context_menu_item(
+                                "menu-close-all",
+                                "Close All Tabs",
+                                true,
+                                move |this, w, cx| {
+                                    this.batch_close_tabs(CloseTabsKind::All, target_index, w, cx);
+                                },
+                                cx,
+                            )),
+                    ),
+            ),
+        )
+        .into_any_element()
     }
 
     fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -1284,6 +1555,7 @@ impl Render for Editor {
         let chars = self.chars;
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(0x13151b))
@@ -1393,6 +1665,7 @@ impl Render for Editor {
                         if self.crlf { "CRLF" } else { "LF" }
                     )),
             )
+            .child(self.tab_context_menu_panel(window, cx))
     }
 }
 
@@ -1912,6 +2185,50 @@ mod tests {
         // 上下越界安全保护
         assert_eq!(minimap_coord_to_line(-100.0, 0.0, line_height, TOTAL_LINES), 0);
         assert_eq!(minimap_coord_to_line(10000.0, scroll_y, line_height, TOTAL_LINES), 999);
+    }
+
+        #[test]
+    fn batch_close_tabs_indices_calculation() {
+        use super::{calculate_tabs_to_close_indices, CloseTabsKind};
+
+        // Total 5 tabs: [0, 1, 2, 3, 4], target is 2
+        let total = 5;
+        let target = 2;
+
+        // 1. Close All: 逆序关闭所有索引 [4, 3, 2, 1, 0]
+        let all_indices = calculate_tabs_to_close_indices(CloseTabsKind::All, target, total);
+        assert_eq!(all_indices, vec![4, 3, 2, 1, 0]);
+
+        // 2. Close Others: 保留 2，先关右侧 [4, 3]，再关左侧 [1, 0]
+        let others_indices = calculate_tabs_to_close_indices(CloseTabsKind::Others, target, total);
+        assert_eq!(others_indices, vec![4, 3, 1, 0]);
+
+        // 3. Close Tabs to the Right: 仅关闭右侧 [4, 3]
+        let right_indices = calculate_tabs_to_close_indices(CloseTabsKind::Right, target, total);
+        assert_eq!(right_indices, vec![4, 3]);
+
+        // 4. Close Tabs to the Left: 仅关闭左侧 [1, 0]
+        let left_indices = calculate_tabs_to_close_indices(CloseTabsKind::Left, target, total);
+        assert_eq!(left_indices, vec![1, 0]);
+
+        // 边界测试：处于最左侧 target = 0
+        let left_at_zero = calculate_tabs_to_close_indices(CloseTabsKind::Left, 0, total);
+        assert!(left_at_zero.is_empty(), "No tabs to the left of index 0");
+        let right_at_zero = calculate_tabs_to_close_indices(CloseTabsKind::Right, 0, total);
+        assert_eq!(right_at_zero, vec![4, 3, 2, 1]);
+
+        // 边界测试：处于最右侧 target = 4
+        let right_at_end = calculate_tabs_to_close_indices(CloseTabsKind::Right, 4, total);
+        assert!(right_at_end.is_empty(), "No tabs to the right of index 4");
+        let left_at_end = calculate_tabs_to_close_indices(CloseTabsKind::Left, 4, total);
+        assert_eq!(left_at_end, vec![3, 2, 1, 0]);
+
+        // 边界测试：只有一个 tab 时
+        let single_total = 1;
+        assert!(calculate_tabs_to_close_indices(CloseTabsKind::Others, 0, single_total).is_empty());
+        assert!(calculate_tabs_to_close_indices(CloseTabsKind::Right, 0, single_total).is_empty());
+        assert!(calculate_tabs_to_close_indices(CloseTabsKind::Left, 0, single_total).is_empty());
+        assert_eq!(calculate_tabs_to_close_indices(CloseTabsKind::All, 0, single_total), vec![0]);
     }
 
     #[test]

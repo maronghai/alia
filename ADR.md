@@ -290,3 +290,36 @@ IDE/编辑器需要提供左侧文件树，支持按需展开/折叠、状态缓
 ### 架构收益
 - 保障了打开 30+ 文件时的界面稳定性和布局规整性。
 - 无需手动计算各个 Tab 像素级边界，利用 GPUI 原生交互体系实现了声明式自动滚入。
+
+
+## ADR-012：Tab 右键上下文菜单与批量关闭保护机制
+
+### 背景 (Context)
+随着编辑器支持打开数十个文件并加入多 Tab 横向滚动，用户管理标签页的操作成本增加。当存在大量临时文件或多分支文件时，逐个点击“×”关闭体验繁琐。用户需要右键弹出上下文菜单，支持：
+1. 关闭当前标签页（Close Tab）
+2. 关闭其它标签页（Close Other Tabs）
+3. 关闭右侧所有标签页（Close Tabs to the Right）
+4. 关闭左侧所有标签页（Close Tabs to the Left）
+5. 关闭所有标签页（Close All Tabs）
+
+### 决策 (Decision)
+1. **状态驱动的轻量级 Context Menu 模型 (`TabContextMenu`)**：
+   - 在 `Editor` 状态中保留 `tab_context_menu: Option<TabContextMenu>`，记录触发位置 `position: Point<Pixels>` 与目标标签索引 `tab_index`。
+   - 在 Tab 栏项监听 `on_mouse_down(MouseButton::Right)` 触发唤起，并自动将当前右键项切为激活 Tab。
+   - 顶层渲染透明遮罩 (`#tab-context-menu-backdrop`) 捕获全局左键/右键点击，实现无状态污染的自动收起（Dismiss）。
+   - 菜单样式遵循无中文字符与现代深色调（Slate/Charcoal `#1a1e28`、边框 `#323a4e`、微阴影、悬停高亮、禁用状态置灰）。
+2. **纯函数逆序索引序列计划 (`calculate_tabs_to_close_indices`)**：
+   - 批量关闭涉及数组索引动态前移的经典陷阱。若从左到右删除，已删元素的索引变化会导致后续删除越界或误删。
+   - 设计纯函数 `calculate_tabs_to_close_indices` 采用逆序序列：
+     - `CloseTabsKind::All`：`(0..total).rev()` 从最右侧向最左侧逐个移除；
+     - `CloseTabsKind::Others`：先逆序清除右侧 `(target+1..total).rev()`，再逆序清除左侧 `(0..target).rev()`，目标元素不受任何索引前移扰动；
+     - `CloseTabsKind::Right`：`(target+1..total).rev()`；
+     - `CloseTabsKind::Left`：`(0..target).rev()`。
+3. **未保存修改事务保护与中途中断处理**：
+   - 单 Tab 关闭函数 `close_tab_at` 返回 `bool`（成功返回 `true`，用户取消返回 `false`）。
+   - 批量关闭在遍历逆序索引时，若遇到某个 Tab 包含未保存修改且用户在原生对话框中选择了“Cancel”，批量关闭立即中断，保护后续文件不被误关。
+   - 若全部标签页被关闭，自动为用户开启干净的空白文档 (`Untitled-1.txt`)，维持编辑器始终处于可用编辑状态。
+
+### 影响与评估 (Consequences)
+- 24 项单元测试覆盖了边界值（最左侧、最右侧、单 Tab、逆序索引精确匹配）；
+- 杜绝了批量操作时的索引漂移 BUG，保障了用户未保存文档的安全性。

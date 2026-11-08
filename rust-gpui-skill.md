@@ -387,3 +387,96 @@ let end_row = (((scroll_y + container_height) / line_height).ceil() as usize).mi
    - **解决方案**：外层 Tab 设置 `.min_w(px(120.)).max_w(px(220.))`，文本容器设置 `.flex_1().min_w_0().overflow_hidden().text_ellipsis()`。
 2. **切换 Tab 无法自动滚入可视区**：
    - **解决方案**：在渲染容器使用 `.track_scroll(&self.tab_scroll_handle)`，切换时调用 `self.tab_scroll_handle.scroll_to_item(index)`。GPUI 会在 Prepaint 阶段结合子组件 bounds 自动调整水平 `scroll_offset.x`。
+
+
+---
+
+## 12. Tab 右键上下文菜单、逆序索引批量关闭与未保存保护机制
+
+### 12.1 浮动上下文菜单的 GPUI 状态驱动实现
+在桌面端 UI 开发中，弹出菜单通常有两种方式：
+1. **系统原生菜单（Win32 TrackPopupMenu）**：外观与现代 GPU 窗口风格严重割裂，且进入 Win32 模态循环会导致 GPUI 借用冲突；
+2. **状态驱动声明式弹出层**：
+   - 将菜单视为视图模型的一个瞬态状态：
+     ```rust
+     #[derive(Clone, Debug)]
+     struct TabContextMenu {
+         tab_index: usize,
+         position: Point<Pixels>,
+     }
+     ```
+   - 在 Tab 上监听鼠标右键：
+     ```rust
+     .on_mouse_down(
+         MouseButton::Right,
+         cx.listener(move |this, event: &MouseDownEvent, w, cx| {
+             this.open_tab_context_menu(index, event.position, w, cx);
+         }),
+     )
+     ```
+   - 在根视图最上层渲染浮层：底层是一个铺满全屏的透明 `backdrop` 捕获所有点击以清空 `tab_context_menu`；上层是一个使用 `absolute().top(y).left(x)` 定位的圆角暗色浮窗。这样完全无需复杂的外部组件，实现零副作用的 Dismiss 机制。
+
+### 12.2 逆序索引消除批量删除漂移陷阱
+**面试与实战高频陷阱**：在 `Vec<T>` 中按索引批量删除元素。
+若按 `[0, 1, 2]` 从前向后删除：
+- 删除了 `0` 后，原 `1` 变成了新的 `0`，原 `2` 变成了新的 `1`；若继续删除索引 `1`，实际删掉的是原 `2`，原 `1` 被漏掉了！
+**架构解法**：采用**逆序序列（Reverse Order Sequence）**。
+```rust
+pub fn calculate_tabs_to_close_indices(
+    kind: CloseTabsKind,
+    target_index: usize,
+    total_tabs: usize,
+) -> Vec<usize> {
+    match kind {
+        CloseTabsKind::All => (0..total_tabs).rev().collect(),
+        CloseTabsKind::Others => {
+            let mut indices = Vec::new();
+            if target_index < total_tabs {
+                for i in (target_index + 1..total_tabs).rev() {
+                    indices.push(i);
+                }
+                for i in (0..target_index).rev() {
+                    indices.push(i);
+                }
+            }
+            indices
+        }
+        CloseTabsKind::Right => {
+            if target_index + 1 < total_tabs {
+                (target_index + 1..total_tabs).rev().collect()
+            } else {
+                Vec::new()
+            }
+        }
+        CloseTabsKind::Left => {
+            if target_index < total_tabs {
+                (0..target_index).rev().collect()
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+```
+因为从大索引向小索引删除时，高位元素的移除绝不会改变低位元素的下标，逻辑严密且支持单元测试纯函数验证。
+
+### 12.3 批量操作的中断事务保护
+批量删除必须时刻尊重用户的未保存修改：
+```rust
+fn batch_close_tabs(&mut self, kind: CloseTabsKind, target_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    self.tab_context_menu = None;
+    let indices = calculate_tabs_to_close_indices(kind, target_index, self.tabs.len());
+    for index in indices {
+        if index < self.tabs.len() {
+            // 若用户点击了对话框的 Cancel，立即中断事务，保护剩余文件
+            if !self.close_tab_at(index, window, cx) {
+                break;
+            }
+        }
+    }
+    if !self.tabs.is_empty() {
+        let active = self.active_tab.min(self.tabs.len() - 1);
+        self.switch_tab(active, window, cx);
+    }
+}
+```

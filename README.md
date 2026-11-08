@@ -17,6 +17,7 @@
   - Open and switch between multiple documents.
   - Avoid duplicate tabs through normalized path comparison.
   - Protect unsaved changes when closing tabs or exiting.
+  - Right-click context menu: Close Tab, Close Other Tabs, Close Tabs to the Right, Close Tabs to the Left, Close All Tabs with unsaved confirmation.
 - **Project Explorer**:
   - Browse hierarchical directories with expand and collapse support.
   - Use a virtualized file tree to keep large directories responsive.
