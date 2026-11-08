@@ -40,9 +40,9 @@ fn native_dialog<T: Send + 'static>(
     std::thread::Builder::new()
         .name("native-file-dialog".into())
         .spawn(operation)
-        .map_err(|err| format!("无法启动文件对话框：{err}"))?
+        .map_err(|err| format!("Failed to launch file dialog: {err}"))?
         .join()
-        .map_err(|_| "文件对话框意外退出，请重试。".to_string())
+        .map_err(|_| "File dialog exited unexpectedly, please try again.".to_string())
 }
 
 
@@ -377,7 +377,7 @@ impl Editor {
             InputState::new(window, cx)
                 .code_editor("text")
                 .line_number(true)
-                .placeholder("开始输入，或按 Ctrl+O 打开文本文件…")
+                .placeholder("Start typing, or press Ctrl+O to open a file...")
         });
         let subscription = cx.subscribe_in(&input, window, |this, input, event, _, cx| {
             if matches!(event, InputEvent::Change) {
@@ -431,7 +431,7 @@ impl Editor {
             tree_scroll_handle: UniformListScrollHandle::new(),
             flattened_tree: Vec::new(),
             scroll_tree_to_active: Cell::new(true),
-            message: "就绪".into(),
+            message: "Ready".into(),
             last_window_title: String::new(),
         };
         editor.rebuild_flattened_tree();
@@ -481,7 +481,7 @@ impl Editor {
         self.message = message.clone();
         let _ = native_dialog(move || {
             MessageDialog::new()
-                .set_title("操作失败")
+                .set_title("Operation Failed")
                 .set_level(MessageLevel::Error)
                 .set_description(&message)
                 .show()
@@ -494,9 +494,9 @@ impl Editor {
             let current_path = self.path.clone();
             let selected = native_dialog(move || {
                 let mut dialog = FileDialog::new()
-                    .set_title("保存文本文件")
-                    .add_filter("文本文件", &["txt"])
-                    .add_filter("所有文件", &["*"]);
+                    .set_title("Save Text File")
+                    .add_filter("Text Files", &["txt"])
+                    .add_filter("All Files", &["*"]);
                 if let Some(path) = &current_path {
                     if let Some(parent) = path.parent() {
                         dialog = dialog.set_directory(parent);
@@ -505,7 +505,7 @@ impl Editor {
                         dialog = dialog.set_file_name(name.to_string_lossy());
                     }
                 } else {
-                    dialog = dialog.set_file_name("未命名.txt");
+                    dialog = dialog.set_file_name("Untitled.txt");
                 }
                 dialog.save_file()
             });
@@ -528,7 +528,7 @@ impl Editor {
             .any(|(i, tab)| i != self.active_tab && tab.path.as_ref() == Some(&path))
         {
             self.error(
-                "该文件已在其他标签中打开，请切换到对应标签保存。".into(),
+                "This file is already open in another tab. Please switch to that tab to save.".into(),
                 cx,
             );
             return false;
@@ -536,7 +536,7 @@ impl Editor {
         let text = self.text(cx);
         let output = encode_text(&text, self.crlf, self.bom);
         if let Err(err) = fs::write(&path, output) {
-            self.error(format!("无法保存文件 {}：{err}", path.display()), cx);
+            self.error(format!("Cannot save file {}: {err}", path.display()), cx);
             return false;
         }
         self.path = Some(path);
@@ -544,7 +544,7 @@ impl Editor {
         self.saved_text = text;
         self.dirty_cached = false;
         self.reveal_active_in_tree();
-        self.message = "已保存".into();
+        self.message = "Saved".into();
         self.input.update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
         true
@@ -557,8 +557,8 @@ impl Editor {
         let name = self.document_name(self.active_tab);
         let decision = native_dialog(move || {
             MessageDialog::new()
-            .set_title("保存更改")
-            .set_description(format!("文档“{name}”有未保存的更改。是否先保存？\n选择“否”将放弃更改，选择“取消”返回编辑。"))
+            .set_title("Save Changes")
+            .set_description(format!("Document \"{name}\" has unsaved changes. Do you want to save first?\nChoose 'No' to discard, or 'Cancel' to return."))
             .set_level(MessageLevel::Warning)
             .set_buttons(MessageButtons::YesNoCancel)
             .show()
@@ -580,7 +580,7 @@ impl Editor {
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("未命名-{}.txt", doc.untitled_id))
+            .unwrap_or_else(|| format!("Untitled-{}.txt", doc.untitled_id))
     }
 
     fn switch_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -598,7 +598,7 @@ impl Editor {
         self.next_untitled_id += 1;
         self.tabs.push(doc);
         self.switch_tab(self.tabs.len() - 1, window, cx);
-        self.message = "新建文档".into();
+        self.message = "New document".into();
     }
 
     fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -621,7 +621,7 @@ impl Editor {
             };
             self.switch_tab(next, window, cx);
         }
-        self.message = "标签已关闭".into();
+        self.message = "Tab closed".into();
         cx.notify();
     }
 
@@ -661,9 +661,9 @@ impl Editor {
             .w_full()
             .min_w_0()
             .overflow_x_scroll()
-            .bg(rgb(0x192233))
+            .bg(rgb(0x13161f))
             .border_b_1()
-            .border_color(rgb(0x303b50))
+            .border_color(rgb(0x232838))
             .children(self.tabs.iter().enumerate().map(|(index, doc)| {
                 let dirty = doc.dirty_cached;
                 let name = self.document_name(index);
@@ -678,12 +678,15 @@ impl Editor {
                     .text_sm()
                     .cursor_pointer()
                     .bg(rgb(if index == self.active_tab {
-                        0x30496b
+                        0x1a1e29
                     } else {
-                        0x192233
+                        0x13161f
                     }))
+                    .hover(|style| style.bg(rgb(0x1b202b)))
+                    .border_t_2()
+                    .border_color(rgb(if index == self.active_tab { 0x3b82f6 } else { 0x13161f }))
                     .border_r_1()
-                    .border_color(rgb(0x303b50))
+                    .border_color(rgb(0x232838))
                     .on_click(cx.listener(move |this, _, w, cx| this.switch_tab(index, w, cx)))
                     .child(format!("{}{}", if dirty { "● " } else { "" }, name))
                     .child(
@@ -691,7 +694,7 @@ impl Editor {
                             .id(("close-tab", index))
                             .px_1()
                             .rounded_sm()
-                            .hover(|s| s.bg(rgb(0x52617a)))
+                            .hover(|s| s.bg(rgb(0x303746)).text_color(rgb(0xf8fafc)))
                             .child("×")
                             .on_click(cx.listener(move |this, _, w, cx| {
                                 cx.stop_propagation();
@@ -704,14 +707,14 @@ impl Editor {
     fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
         let selected = native_dialog(|| {
             FileDialog::new()
-                .set_title("打开 UTF-8 文本文件")
+                .set_title("Open Text File")
                 .add_filter(
-                    "文本和代码",
+                    "Text & Code",
                     &[
                         "txt", "md", "rs", "toml", "json", "csv", "log", "html", "css", "js", "py",
                     ],
                 )
-                .add_filter("所有文件", &["*"])
+                .add_filter("All Files", &["*"])
                 .pick_files()
         });
         let paths = match selected {
@@ -760,17 +763,17 @@ impl Editor {
                     state.focus(window, cx);
                 });
                 self.reveal_active_in_tree();
-                self.message = "文件已打开".into();
+                self.message = "File opened".into();
                 cx.notify();
             }
-            Err(err) => self.error(format!("无法打开文件 {}：{err}", path.display()), cx),
+            Err(err) => self.error(format!("Cannot open file {}: {err}", path.display()), cx),
         }
     }
 
     fn open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
         let initial = self.tree_root.clone();
         match native_dialog(move || {
-            let mut dialog = FileDialog::new().set_title("打开文件夹");
+            let mut dialog = FileDialog::new().set_title("Open Folder");
             if let Some(root) = initial {
                 dialog = dialog.set_directory(root);
             }
@@ -790,9 +793,9 @@ impl Editor {
                     self.reveal_active_in_tree();
                     self.rebuild_flattened_tree();
                     self.tree_visible = true;
-                    self.message = "文件夹已打开".into();
+                    self.message = "Folder opened".into();
                 }
-                Err(err) => self.message = format!("无法读取文件夹：{err}"),
+                Err(err) => self.message = format!("Cannot read folder: {err}"),
             },
             Ok(None) => return,
             Err(err) => self.message = err,
@@ -825,9 +828,9 @@ impl Editor {
         }
         self.rebuild_flattened_tree();
         self.message = if errors.is_empty() {
-            "文件树已刷新".into()
+            "Explorer refreshed".into()
         } else {
-            format!("刷新失败：{}", errors.join("；"))
+            format!("Refresh failed: {}", errors.join("; "))
         };
         cx.notify();
     }
@@ -871,7 +874,7 @@ impl Editor {
                 self.expanded.insert(path_buf);
                 self.rebuild_flattened_tree();
             }
-            Err(err) => self.message = format!("无法读取目录：{err}"),
+            Err(err) => self.message = format!("Cannot read directory: {err}"),
         }
         cx.notify();
     }
@@ -886,7 +889,7 @@ impl Editor {
                     .to_string_lossy()
                     .into_owned()
             })
-            .unwrap_or("未打开文件夹".into());
+            .unwrap_or("NO FOLDER OPENED".into());
 
         let active_path = self.path.clone();
         if self.scroll_tree_to_active.take() {
@@ -900,21 +903,22 @@ impl Editor {
         let count = self.flattened_tree.len();
 
         div()
-            .w(px(250.))
+            .w(px(240.))
             .h_full()
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .bg(rgb(0x192233))
+            .bg(rgb(0x151821))
             .border_r_1()
-            .border_color(rgb(0x303b50))
+            .border_color(rgb(0x232838))
             .child(
                 div()
                     .px_3()
-                    .py_2()
-                    .text_sm()
+                    .py_3()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
                     .font_weight(FontWeight::BOLD)
-                    .child("资源管理器"),
+                    .child("EXPLORER"),
             )
             .child(
                 div()
@@ -922,10 +926,10 @@ impl Editor {
                     .gap_2()
                     .px_2()
                     .pb_2()
-                    .child(tool("tree-open", "打开文件夹").on_click(
+                    .child(tool("tree-open", "Open Folder").on_click(
                         cx.listener(|this, _, w, cx| this.open_folder(&OpenFolder, w, cx)),
                     ))
-                    .child(tool("tree-refresh", "刷新").on_click(
+                    .child(tool("tree-refresh", "Refresh").on_click(
                         cx.listener(|this, _, w, cx| this.refresh_tree(&RefreshTree, w, cx)),
                     )),
             )
@@ -977,8 +981,9 @@ impl Editor {
                                             .text_sm()
                                             .cursor_pointer()
                                             .overflow_hidden()
-                                            .bg(rgb(if active { 0x30496b } else { 0x192233 }))
-                                            .hover(|style| style.bg(rgb(0x293a53)))
+                                            .bg(rgb(if active { 0x232a3b } else { 0x151821 }))
+                                            .text_color(rgb(if active { 0xf8fafc } else { 0xcbd5e1 }))
+                                            .hover(|style| style.bg(rgb(0x1c202c)))
                                             .child(label)
                                             .on_click(cx.listener(move |this, _, w, cx| {
                                                 if is_dir {
@@ -1002,9 +1007,9 @@ impl Editor {
     fn toggle_minimap(&mut self, _: &ToggleMinimap, _: &mut Window, cx: &mut Context<Self>) {
         self.minimap_visible = !self.minimap_visible;
         self.message = if self.minimap_visible {
-            "已开启代码缩略图 (Minimap)".into()
+            "Minimap enabled".into()
         } else {
-            "已隐藏代码缩略图 (Minimap)".into()
+            "Minimap hidden".into()
         };
         cx.notify();
     }
@@ -1029,9 +1034,9 @@ impl Editor {
 
         div().id("editor-minimap").w(px(140.)).h_full().min_h_0()
             .flex_shrink_0().flex().flex_col().overflow_hidden()
-            .bg(rgb(0x101724)).border_l_1().border_color(rgb(0x35445b))
-            .child(div().px_2().py_1().text_xs().text_color(rgb(0xa8bbd5))
-                .child("MINIMAP · 滚动/拖拽/定位"))
+            .bg(rgb(0x111319)).border_l_1().border_color(rgb(0x202430))
+            .child(div().px_2().py_2().text_xs().text_color(rgb(0x64748b))
+                .child("MINIMAP"))
             .child(div().id("minimap-canvas").relative().flex_1().min_h_0()
                 .cursor_pointer().overflow_hidden()
                 .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
@@ -1152,7 +1157,7 @@ impl Editor {
 /// Use the exact language IDs registered by gpui-component's Tree-sitter backend.
 fn detect_language(path: Option<&Path>) -> (&'static str, &'static str) {
     let Some(path) = path else {
-        return ("text", "纯文本");
+        return ("text", "Plain Text");
     };
     let name = path
         .file_name()
@@ -1202,7 +1207,7 @@ fn detect_language(path: Option<&Path>) -> (&'static str, &'static str) {
         "diff" | "patch" => ("diff", "Diff"),
         "ejs" => ("ejs", "EJS"),
         "erb" => ("erb", "ERB"),
-        _ => ("text", "纯文本"),
+        _ => ("text", "Plain Text"),
     }
 }
 
@@ -1210,9 +1215,9 @@ fn decode_text(bytes: &[u8]) -> Result<(String, bool, bool), String> {
     let bom = bytes.starts_with(&[0xef, 0xbb, 0xbf]);
     let bytes = if bom { &bytes[3..] } else { bytes };
     let text = std::str::from_utf8(bytes)
-        .map_err(|_| "文件不是有效的 UTF-8 编码，请先转换为 UTF-8。".to_string())?;
+        .map_err(|_| "File is not valid UTF-8. Please convert it to UTF-8 first.".to_string())?;
     if text.contains('\0') {
-        return Err("文件包含二进制数据，无法作为文本打开。".into());
+        return Err("File contains binary data and cannot be opened as text.".into());
     }
     let crlf = text.contains("\r\n");
     Ok((text.replace("\r\n", "\n").replace('\r', "\n"), crlf, bom))
@@ -1240,8 +1245,11 @@ fn tool(id: &'static str, label: &'static str) -> Stateful<Div> {
         .py_2()
         .rounded_md()
         .cursor_pointer()
-        .bg(rgb(0x253047))
-        .hover(|style| style.bg(rgb(0x354767)))
+        .bg(rgb(0x1f232e))
+        .border_1()
+        .border_color(rgb(0x2d3445))
+        .hover(|style| style.bg(rgb(0x2a3040)))
+        .text_color(rgb(0xd1d5db))
         .text_sm()
         .child(label)
 }
@@ -1265,9 +1273,9 @@ impl Render for Editor {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x141b29))
-            .text_color(rgb(0xdce5f4))
-            .font_family("Microsoft YaHei UI")
+            .bg(rgb(0x13151b))
+            .text_color(rgb(0xe2e8f0))
+            .font_family("Segoe UI")
             .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::save_file))
@@ -1292,30 +1300,31 @@ impl Render for Editor {
                             .text_lg()
                             .font_weight(FontWeight::BOLD)
                             .mr_4()
+                            .text_color(rgb(0x60a5fa))
                             .child("alia"),
                     )
-                    .child(tool("toggle-tree", "文件树").on_click(
+                    .child(tool("toggle-tree", "Explorer").on_click(
                         cx.listener(|this, _, w, cx| this.toggle_tree(&ToggleTree, w, cx)),
                     ))
-                    .child(tool("toggle-minimap", if self.minimap_visible { "缩略图 ●" } else { "缩略图 ○" }).on_click(
+                    .child(tool("toggle-minimap", if self.minimap_visible { "Minimap ON" } else { "Minimap OFF" }).on_click(
                         cx.listener(|this, _, w, cx| this.toggle_minimap(&ToggleMinimap, w, cx)),
                     ))
                     .child(
-                        tool("new", "新建  Ctrl+N")
+                        tool("new", "New   Ctrl+N")
                             .on_click(cx.listener(|this, _, w, cx| this.new_file(&NewFile, w, cx))),
                     )
                     .child(
-                        tool("open", "打开  Ctrl+O").on_click(
+                        tool("open", "Open   Ctrl+O").on_click(
                             cx.listener(|this, _, w, cx| this.open_file(&OpenFile, w, cx)),
                         ),
                     )
                     .child(
-                        tool("save", "保存  Ctrl+S").on_click(
+                        tool("save", "Save   Ctrl+S").on_click(
                             cx.listener(|this, _, w, cx| this.save_file(&SaveFile, w, cx)),
                         ),
                     )
                     .child(
-                        tool("save-as", "另存为")
+                        tool("save-as", "Save As")
                             .on_click(cx.listener(|this, _, w, cx| this.save_as(&SaveAs, w, cx))),
                     ),
             )
@@ -1359,13 +1368,13 @@ impl Render for Editor {
                     .px_4()
                     .py_2()
                     .text_xs()
-                    .bg(rgb(0x202c42))
+                    .bg(rgb(0x101217)).border_t_1().border_color(rgb(0x1e222d))
                     .child(format!(
-                        "{}   ·   {} 行   {} 字符",
+                        "{}   ·   {} lines   {} chars",
                         self.message, lines, chars
                     ))
                     .child(format!(
-                        "{}   |   UTF-8{}   |   {}   |   Ctrl+F 查找 / 替换",
+                        "{}   |   UTF-8{}   |   {}   |   Ctrl+F Find / Replace",
                         detect_language(self.path.as_deref()).1,
                         if self.bom { " BOM" } else { "" },
                         if self.crlf { "CRLF" } else { "LF" }
@@ -1454,7 +1463,7 @@ fn main() {
                             editor.tree_root = Some(root);
                         }
                         if path.is_dir() {
-                            editor.message = "文件夹已打开".into();
+                            editor.message = "Folder opened".into();
                         } else {
                             editor.open_path(path, window, cx);
                         }
@@ -1470,7 +1479,7 @@ fn main() {
                 cx.new(|cx| Root::new(editor, window, cx))
             },
         )
-        .expect("无法创建编辑器窗口");
+        .expect("Failed to create editor window");
         cx.activate(true);
     });
 }
