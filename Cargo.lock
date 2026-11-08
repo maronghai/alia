@@ -43,6 +43,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "alia"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+ "rfd",
+]
+
+[[package]]
 name = "aligned"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2362,15 +2371,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "gpui_editor"
-version = "0.1.0"
-dependencies = [
- "gpui",
- "gpui-component",
- "rfd",
 ]
 
 [[package]]

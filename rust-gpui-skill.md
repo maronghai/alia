@@ -1,6 +1,6 @@
 # Rust & GPUI 桌面客户端实战经验与技能总结
 
-> **项目沉淀**：基于 Ferrite 文本编辑器 (Windows 平台) 的 Rust + GPUI 生产级开发实践  
+> **项目沉淀**：基于 alia (Windows 平台) 的 Rust + GPUI 生产级开发实践  
 > **核心技术栈**：Rust (2024 Edition) + GPUI 0.2 + gpui-component 0.5 + Tree-sitter + rfd 0.15  
 > **文档定位**：架构心智模型、核心设计模式、Windows 原生集成避坑指南、重难点深度剖析及高频面试考点。
 

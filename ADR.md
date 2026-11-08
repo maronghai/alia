@@ -1,6 +1,6 @@
 # 架构决策记录 (Architecture Decision Records - ADR)
 
-**项目名称**：Ferrite 文本编辑器 (gpui_editor)  
+**项目名称**：alia 文本编辑器 (alia)  
 **目标平台**：Windows (x86_64)  
 **核心技术栈**：Rust (2024 Edition) + GPUI 0.2 + gpui-component 0.5 + Tree-sitter + rfd 0.15  
 **文档状态**：已批准 (Approved) / 活跃维护中  
@@ -113,7 +113,7 @@ IDE/编辑器需要提供左侧文件树，支持按需展开/折叠、状态缓
 ## ADR-005：Windows 启动参数与文件关联深度适配 (无损 Unicode & 路径归一化)
 
 ### 背景 (Context)
-在 Windows 系统中将 Ferrite 设为某类文件（例如 `.md`）的默认打开方式后，双击文件时 Windows 会通过命令行参数传入被点击文件的完整路径。
+在 Windows 系统中将 alia 设为某类文件（例如 `.md`）的默认打开方式后，双击文件时 Windows 会通过命令行参数传入被点击文件的完整路径。
 传统使用 `std::env::args()` 的做法会强行以 UTF-8 校验字符串，且易丢失复杂的 Windows 本地化路径；同时未处理启动参数导致程序直接打开空白默认文档，无法加载目标文件。
 
 ### 决策 (Decision)
@@ -190,16 +190,16 @@ IDE/编辑器需要提供左侧文件树，支持按需展开/折叠、状态缓
 
 1. **Rust 所有权与 GUI 状态管理 (Deref / DerefMut 与实体借用)**：
    - *考点*：GUI 框架普遍存在双向引用与事件回调，Rust 如何解决所有权与借用冲突？
-   - *Ferrite 实践*：利用 GPUI 的 `Entity<T>`（受管引用的强弱引用模型）和 `cx.subscribe_in` 事件发布订阅模式。通过对 `Editor` 实现 `Deref<Target = Document>`，在单文档操作时享受透明解引用的优雅语法，同时底层通过精准可变借用保证数据安全。
+   - *alia 实践*：利用 GPUI 的 `Entity<T>`（受管引用的强弱引用模型）和 `cx.subscribe_in` 事件发布订阅模式。通过对 `Editor` 实现 `Deref<Target = Document>`，在单文档操作时享受透明解引用的优雅语法，同时底层通过精准可变借用保证数据安全。
 2. **多线程边界与 Send / 'static 约束**：
    - *考点*：Rust 跨线程传递闭包为何需要 `FnOnce() + Send + 'static`？
-   - *Ferrite 实践*：`native_dialog` 的实现展示了标准的类型约束。闭包携带所有权跨越线程边界，返回值通过通道或 `join().unwrap()` 安全送回，充分体现并发安全无数据竞争。
+   - *alia 实践*：`native_dialog` 的实现展示了标准的类型约束。闭包携带所有权跨越线程边界，返回值通过通道或 `join().unwrap()` 安全送回，充分体现并发安全无数据竞争。
 3. **文件 I/O、内存映射与字符编码安全**：
    - *考点*：如何严格区分非法 UTF-8、二进制文件以及合法的本地化编码？
-   - *Ferrite 实践*：在载入阶段进行快速二进制嗅探（如检测 null 字节 `0x00` 与无效 UTF-8 序列），防止破坏二进制文件；支持零拷贝嗅探 BOM 与 CRLF。
+   - *alia 实践*：在载入阶段进行快速二进制嗅探（如检测 null 字节 `0x00` 与无效 UTF-8 序列），防止破坏二进制文件；支持零拷贝嗅探 BOM 与 CRLF。
 4. **GUI 架构模式演进（Retained Mode vs Immediate Mode vs GPUI 混合模型）**：
    - *考点*：GPUI 与传统 Dear ImGui 或 Qt 有何区别？
-   - *Ferrite 实践*：GPUI 拥有类似 React 的声明式 DSL（基于流式 Builder API），但在底层构建的是由 GPU 批处理绘制的高性能渲染树。既保证了声明式编程的开发效率，又杜绝了即时模式下的重复状态计算开销。
+   - *alia 实践*：GPUI 拥有类似 React 的声明式 DSL（基于流式 Builder API），但在底层构建的是由 GPU 批处理绘制的高性能渲染树。既保证了声明式编程的开发效率，又杜绝了即时模式下的重复状态计算开销。
 
 
 ## ADR-007：海量节点下资源管理器视口智能居中与 Tab 联动滚动

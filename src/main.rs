@@ -1251,7 +1251,7 @@ impl Render for Editor {
         let dirty = self.dirty_cached;
         let name = self.document_name(self.active_tab);
         let title = format!(
-            "{}{} — Ferrite 文本编辑器",
+            "{}{} — alia",
             if dirty { "● " } else { "" },
             name
         );
@@ -1292,7 +1292,7 @@ impl Render for Editor {
                             .text_lg()
                             .font_weight(FontWeight::BOLD)
                             .mr_4()
-                            .child("Ferrite"),
+                            .child("alia"),
                     )
                     .child(tool("toggle-tree", "文件树").on_click(
                         cx.listener(|this, _, w, cx| this.toggle_tree(&ToggleTree, w, cx)),
@@ -1429,7 +1429,7 @@ fn main() {
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Ferrite 文本编辑器".into()),
+                    title: Some("alia".into()),
                     ..Default::default()
                 }),
                 window_min_size: Some(size(px(720.), px(420.))),
