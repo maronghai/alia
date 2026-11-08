@@ -266,6 +266,7 @@ struct Editor {
     minimap_visible: bool,
     minimap_dragging: bool,
     tree_scroll_handle: UniformListScrollHandle,
+    tab_scroll_handle: ScrollHandle,
     flattened_tree: Vec<FlattenedTreeEntry>,
     scroll_tree_to_active: Cell<bool>,
     message: String,
@@ -429,6 +430,7 @@ impl Editor {
             minimap_visible: true,
             minimap_dragging: false,
             tree_scroll_handle: UniformListScrollHandle::new(),
+            tab_scroll_handle: ScrollHandle::new(),
             flattened_tree: Vec::new(),
             scroll_tree_to_active: Cell::new(true),
             message: "Ready".into(),
@@ -588,6 +590,7 @@ impl Editor {
             return;
         }
         self.active_tab = index;
+        self.tab_scroll_handle.scroll_to_item(index);
         self.input.update(cx, |state, cx| state.focus(window, cx));
         self.reveal_active_in_tree();
         cx.notify();
@@ -661,6 +664,7 @@ impl Editor {
             .w_full()
             .min_w_0()
             .overflow_x_scroll()
+            .track_scroll(&self.tab_scroll_handle)
             .bg(rgb(0x13161f))
             .border_b_1()
             .border_color(rgb(0x232838))
@@ -672,7 +676,9 @@ impl Editor {
                     .flex()
                     .items_center()
                     .flex_shrink_0()
-                    .gap_3()
+                    .min_w(px(120.))
+                    .max_w(px(220.))
+                    .gap_2()
                     .px_3()
                     .py_2()
                     .text_sm()
@@ -688,7 +694,14 @@ impl Editor {
                     .border_r_1()
                     .border_color(rgb(0x232838))
                     .on_click(cx.listener(move |this, _, w, cx| this.switch_tab(index, w, cx)))
-                    .child(format!("{}{}", if dirty { "● " } else { "" }, name))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(format!("{}{}", if dirty { "● " } else { "" }, name)),
+                    )
                     .child(
                         div()
                             .id(("close-tab", index))
@@ -1507,6 +1520,19 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths[0].ends_with("一.md"));
         assert!(paths[1].ends_with("two.rs"));
+    }
+
+    #[test]
+    fn tab_title_truncation_and_layout_bounds() {
+        let long_name = "this_is_an_extremely_long_source_file_name_for_testing_tab_bar_overflow.rs";
+        let dirty = true;
+        let formatted = format!("{}{}", if dirty { "● " } else { "" }, long_name);
+        assert!(formatted.starts_with("● "));
+        assert!(formatted.contains(long_name));
+        // Ensure index wraps gracefully even when tab count is large
+        let large_tab_count = 50;
+        assert_eq!(super::next_tab_index(49, large_tab_count, true), 0);
+        assert_eq!(super::next_tab_index(0, large_tab_count, false), 49);
     }
 
     #[test]

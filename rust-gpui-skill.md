@@ -375,3 +375,15 @@ let end_row = (((scroll_y + container_height) / line_height).ceil() as usize).mi
 ### 10.3 GPUI 滚轮与拖拽事件组合
 - `on_scroll_wheel`：监听 `ScrollWheelEvent`，提取 `delta: ScrollDelta`（支持 `Lines` 和 `Pixels` 两种模式），将垂直滚轮增量换算为行推进量并更新 `InputState`；
 - `on_mouse_down` + `on_mouse_move` + `on_mouse_up` / `on_mouse_up_out`：维护简单的 `minimap_dragging: bool` 状态机，鼠标按下后在移动过程中持续调用 `minimap_coord_to_line` 实施 Scrubbing，实现雷达导航般的平滑滑动体验。
+
+
+---
+
+## 11. 多标签栏（Tab Bar）溢出治理与 ScrollHandle 水平联动
+
+### 11.1 核心痛点与排错
+在 GPUI 中开发水平滚动 Tab 栏时，容易遇到以下布局陷阱：
+1. **子元素撑开父容器**：如果文本直接作为 flex item，缺少 `.min_w_0()`，flex 默认最小尺寸等于内容尺寸（`min-width: auto`），导致 Tab 无法被 `max_w` 截断。
+   - **解决方案**：外层 Tab 设置 `.min_w(px(120.)).max_w(px(220.))`，文本容器设置 `.flex_1().min_w_0().overflow_hidden().text_ellipsis()`。
+2. **切换 Tab 无法自动滚入可视区**：
+   - **解决方案**：在渲染容器使用 `.track_scroll(&self.tab_scroll_handle)`，切换时调用 `self.tab_scroll_handle.scroll_to_item(index)`。GPUI 会在 Prepaint 阶段结合子组件 bounds 自动调整水平 `scroll_offset.x`。
