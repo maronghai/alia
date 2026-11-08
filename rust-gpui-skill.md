@@ -334,3 +334,44 @@ gpui-component = { version = "=0.5.0", features = ["tree-sitter-languages"] }
 `gpui-component 0.5.0` 的 `InputState::value()` 虽然返回 `SharedString`，实现中仍会执行 `self.text.to_string()`，不能把返回类型当成零拷贝保证。改用 `text()` 获取 Rope，分块比较已保存文本；缓存每个文档的未保存状态、行数和字符数，在 `InputEvent::Change` 中更新，加载和保存时同步更新。渲染只读取缓存。关闭前实时按 Rope 分块核对，撤销回原文仍应恢复未修改状态。
 
 范围限制：文件树仍构建所有展开行，并未实现可视行虚拟化；大文件编辑、目录读取和原生对话框等待仍可能占用 UI 时间。当前产物沿用 debug 构建；未测量具体帧率、延迟和加速倍数，不把优化方案等同于实测流畅性。
+
+
+## Minimap：Canvas、缓存与布局约束
+
+- 右侧固定宽度面板与正文并列时，应让正文 flex_1、min_w_0、overflow_hidden，侧栏 flex_shrink_0，防止长行撑开布局。
+- 使用 Canvas 与 paint_quad(fill(...)) 绘制微小字符笔画，避免每行创建 Div。按文档缓存笔画，InputEvent::Change 时失效；为采样行数和列数设置上限。
+- Canvas 的 prepaint 阶段记录 Bounds，点击用 event.position.y 减 bounds.origin.y，再按实际绘制高度映射行号。短文档未占满面板时也应使用实际绘制高度。
+- gpui-component 0.5.0 未公开 InputState 的滚动句柄；当前框线按光标和面板高度估算，不是实际滚动视口。轻量字符配色也不等同完整语法高亮。不要把上述近似实现描述为与 Sublime Text 完全一致。
+
+
+## 编辑区滚动优化：限制 Minimap 场景图元
+
+2026-11-08：静态检查发现 Minimap 缓存了字符坐标，但 Canvas 绘制仍逐字符提交矩形。现在合并连续同色字符，每行最多 16 段，最多采样 320 行，因此缩略图正文每次绘制最多提交 5120 个矩形（另有位置框与光标标记）。达到段数上限时将后续字符并入最后一段，部分空隙和配色会简化。保留缩进、空行、点击定位和显示隐藏。窗口标题增加缓存，仅在文字改变时调用设置函数。
+
+这是绘制工作量上限优化，不是实测帧率结论；未测量实际滚轮帧耗时，也没有证据证明 Minimap 是唯一瓶颈。当前正文自动换行行为保持不变。
+
+
+---
+
+## 10. Minimap 视口联动平滑滚动、滚轮拦截与拖拽 Scrubbing 实现经验
+
+### 10.1 长短文档自适应滚动模型
+在设计代码缩略图（Minimap）时，常见误区是将所有行等比例压缩进固定高度面板。对于上千行的源码，每行被压缩到不足 0.2px，不仅画面糊成一片，而且失去缩进可读性。
+Sublime Text / VS Code 的成熟做法是：
+- 赋予 Minimap 固定的微型行高（如 `2.4px`），真实还原代码空行和缩进结构；
+- 当 `content_height > container_height` 时，Minimap 自身随主视口滚动而平滑滚动：
+  $$scroll\_y = \frac{cursor\_line}{total\_lines - 1} \times (content\_height - container\_height)$$
+- 视口滑块（Viewport Slider）指示当前可见代码范围，并始终保持在 Minimap 视口内部。
+
+### 10.2 视口范围切片与 GPU 零掉帧优化
+若盲目遍历几千行代码的图元提交给 GPU，滚动时必然产生微掉帧。
+通过 `calculate_minimap_scroll` 计算得到的 `visible_range`：
+```rust
+let start_row = (scroll_y / line_height).floor().max(0.0) as usize;
+let end_row = (((scroll_y + container_height) / line_height).ceil() as usize).min(total_lines);
+```
+无论文件有 1000 行还是 50000 行，每帧仅为可见的 200~300 行提交轻量矩形，渲染耗时恒定在微秒级。
+
+### 10.3 GPUI 滚轮与拖拽事件组合
+- `on_scroll_wheel`：监听 `ScrollWheelEvent`，提取 `delta: ScrollDelta`（支持 `Lines` 和 `Pixels` 两种模式），将垂直滚轮增量换算为行推进量并更新 `InputState`；
+- `on_mouse_down` + `on_mouse_move` + `on_mouse_up` / `on_mouse_up_out`：维护简单的 `minimap_dragging: bool` 状态机，鼠标按下后在移动过程中持续调用 `minimap_coord_to_line` 实施 Scrubbing，实现雷达导航般的平滑滑动体验。

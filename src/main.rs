@@ -3,11 +3,12 @@
 use gpui::*;
 use gpui_component::{
     Root, Theme, ThemeMode,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, RopeExt},
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
+    rc::Rc,
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
@@ -22,6 +23,7 @@ actions!(
         SaveAs,
         OpenFolder,
         ToggleTree,
+        ToggleMinimap,
         RefreshTree,
         CloseTab,
         NextTab,
@@ -90,7 +92,167 @@ struct Document {
     crlf: bool,
     bom: bool,
     untitled_id: usize,
+    minimap_cache: RefCell<Option<Rc<Vec<Vec<(f32, f32, u32)>>>>>,
     _subscription: Subscription,
+}
+
+
+/// Minimap scroll metrics and viewport synchronization
+#[derive(Clone, Debug, PartialEq)]
+pub struct MinimapScrollInfo {
+    pub content_height: f32,
+    pub scroll_y: f32,
+    pub slider_y: f32,
+    pub slider_height: f32,
+    pub visible_range: std::ops::Range<usize>,
+}
+
+pub const MINIMAP_LINE_HEIGHT: f32 = 2.4;
+
+pub fn calculate_minimap_scroll(
+    cursor_line: usize,
+    total_lines: usize,
+    container_height: f32,
+    line_height: f32,
+) -> MinimapScrollInfo {
+    let total_lines = total_lines.max(1);
+    let line_height = line_height.max(1.0);
+    let content_height = total_lines as f32 * line_height;
+    let container_height = container_height.max(1.0);
+
+    let (scroll_y, _max_scroll) = if content_height <= container_height {
+        (0.0, 0.0)
+    } else {
+        let max_s = content_height - container_height;
+        let progress = (cursor_line as f32) / (total_lines.saturating_sub(1).max(1) as f32);
+        ((progress * max_s).clamp(0.0, max_s), max_s)
+    };
+
+    let approx_editor_lines = (container_height / 20.0).clamp(12.0, 80.0);
+    let slider_height = (approx_editor_lines * line_height).clamp(24.0, container_height);
+
+    let cursor_y = (cursor_line as f32 * line_height) - scroll_y;
+    let slider_y = (cursor_y - slider_height * 0.5).clamp(0.0, (container_height - slider_height).max(0.0));
+
+    let start_row = (scroll_y / line_height).floor().max(0.0) as usize;
+    let end_row = (((scroll_y + container_height) / line_height).ceil() as usize).min(total_lines);
+
+    MinimapScrollInfo {
+        content_height,
+        scroll_y,
+        slider_y,
+        slider_height,
+        visible_range: start_row..end_row,
+    }
+}
+
+pub fn minimap_coord_to_line(
+    y_in_canvas: f32,
+    scroll_y: f32,
+    line_height: f32,
+    total_lines: usize,
+) -> usize {
+    if total_lines == 0 || line_height <= 0.0 {
+        return 0;
+    }
+    let absolute_y = (y_in_canvas + scroll_y).max(0.0);
+    let line = (absolute_y / line_height).round() as usize;
+    line.min(total_lines.saturating_sub(1))
+}
+
+/// Minimap display metrics and pure calculation helpers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MinimapLineMetrics {
+    pub indent_px: f32,
+    pub width_px: f32,
+    pub is_empty: bool,
+}
+
+pub fn calculate_minimap_line_metrics(line: &str, max_width_px: f32) -> MinimapLineMetrics {
+    let trimmed_start = line.trim_start();
+    if trimmed_start.is_empty() {
+        return MinimapLineMetrics {
+            indent_px: 0.0,
+            width_px: 0.0,
+            is_empty: true,
+        };
+    }
+    let leading_spaces = line.len() - trimmed_start.len();
+    // 1 space ~= 1.5px indent, capped at 40px
+    let indent_px = ((leading_spaces as f32) * 1.5).min(40.0);
+    // Non-space length scale: roughly 0.8px per char, capped so indent + width <= max_width_px
+    let raw_width = (trimmed_start.len() as f32) * 0.9;
+    let width_px = raw_width.min((max_width_px - indent_px).max(8.0));
+
+    MinimapLineMetrics {
+        indent_px,
+        width_px,
+        is_empty: false,
+    }
+}
+
+pub fn calculate_minimap_viewport(
+    cursor_line: usize,
+    total_lines: usize,
+    viewport_row_span: usize,
+) -> (usize, usize) {
+    if total_lines == 0 {
+        return (0, 0);
+    }
+    let half_span = viewport_row_span / 2;
+    let start = cursor_line.saturating_sub(half_span);
+    let end = (start + viewport_row_span).min(total_lines);
+    let start = if end == total_lines && total_lines > viewport_row_span {
+        total_lines - viewport_row_span
+    } else {
+        start
+    };
+    (start, end)
+}
+
+pub fn minimap_click_to_line(
+    click_y: f32,
+    minimap_height: f32,
+    total_lines: usize,
+) -> usize {
+    if minimap_height <= 0.0 || total_lines == 0 {
+        return 0;
+    }
+    let ratio = (click_y / minimap_height).clamp(0.0, 1.0);
+    let target = (ratio * (total_lines.saturating_sub(1) as f32)).round() as usize;
+    target.min(total_lines.saturating_sub(1))
+}
+
+// Merge adjacent same-color glyphs; bound scene submissions per sampled line.
+pub fn minimap_segments(text: &str) -> Vec<(f32, f32, u32)> {
+    let mut result: Vec<(f32, f32, u32)> = Vec::new();
+    let mut column = 0usize;
+    let mut quoted = false;
+    let trimmed = text.trim_start();
+    let comment = trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("<!--");
+    for ch in text.chars().take(160) {
+        if column >= 100 { break; }
+        if ch == '\t' { column += 4; continue; }
+        if ch == '"' || ch == '\'' { quoted = !quoted; }
+        if !ch.is_whitespace() {
+            let color = if comment { 0x6e9277 } else if quoted { 0xc9b482 }
+                else if ch.is_ascii_digit() { 0xbfa0d5 }
+                else if "{}[]();:=<>".contains(ch) { 0x75b9dc }
+                else { 0x9caec9 };
+            let x = column as f32 * 1.25;
+            let at_limit = result.len() >= 16;
+            if let Some(last) = result.last_mut() {
+                if (last.2 == color && x - (last.0 + last.1) < 0.4) || at_limit {
+                    last.1 = x + 0.9 - last.0;
+                    column += 1;
+                    continue;
+                }
+            }
+            result.push((x, 0.9, color));
+        }
+        column += 1;
+    }
+    result
 }
 
 struct Editor {
@@ -101,10 +263,13 @@ struct Editor {
     tree_cache: HashMap<PathBuf, Vec<TreeEntry>>,
     expanded: HashSet<PathBuf>,
     tree_visible: bool,
+    minimap_visible: bool,
+    minimap_dragging: bool,
     tree_scroll_handle: UniformListScrollHandle,
     flattened_tree: Vec<FlattenedTreeEntry>,
     scroll_tree_to_active: Cell<bool>,
     message: String,
+    last_window_title: String,
 }
 
 impl std::ops::Deref for Editor {
@@ -217,6 +382,7 @@ impl Editor {
         let subscription = cx.subscribe_in(&input, window, |this, input, event, _, cx| {
             if matches!(event, InputEvent::Change) {
                 if let Some(doc) = this.tabs.iter_mut().find(|doc| doc.input == *input) {
+                    *doc.minimap_cache.borrow_mut() = None;
                     let state = input.read(cx);
                     doc.dirty_cached = !text_matches_saved(state, &doc.saved_text);
                     doc.lines = state.text().chunks().map(|chunk| chunk.bytes().filter(|b| *b == b'\n').count()).sum::<usize>() + 1;
@@ -235,6 +401,7 @@ impl Editor {
             crlf: true,
             bom: false,
             untitled_id,
+            minimap_cache: RefCell::new(None),
             _subscription: subscription,
         }
     }
@@ -259,10 +426,13 @@ impl Editor {
             tree_cache,
             expanded: HashSet::new(),
             tree_visible: true,
+            minimap_visible: true,
+            minimap_dragging: false,
             tree_scroll_handle: UniformListScrollHandle::new(),
             flattened_tree: Vec::new(),
             scroll_tree_to_active: Cell::new(true),
             message: "就绪".into(),
+            last_window_title: String::new(),
         };
         editor.rebuild_flattened_tree();
         editor
@@ -828,6 +998,149 @@ impl Editor {
             )
     }
 
+
+    fn toggle_minimap(&mut self, _: &ToggleMinimap, _: &mut Window, cx: &mut Context<Self>) {
+        self.minimap_visible = !self.minimap_visible;
+        self.message = if self.minimap_visible {
+            "已开启代码缩略图 (Minimap)".into()
+        } else {
+            "已隐藏代码缩略图 (Minimap)".into()
+        };
+        cx.notify();
+    }
+
+    fn minimap_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let input = self.input.read(cx);
+        let rope = input.text();
+        let total = rope.lines_len().max(1);
+        let cursor = (input.cursor_position().line as usize).min(total.saturating_sub(1));
+        let samples = {
+            let mut cache = self.minimap_cache.borrow_mut();
+            cache.get_or_insert_with(|| {
+                let lines_to_cache = total.min(10000);
+                Rc::new((0..lines_to_cache).map(|row| {
+                    let text = rope.slice_line(row).chars().take(160).collect::<String>();
+                    minimap_segments(&text)
+                }).collect())
+            }).clone()
+        };
+        let bounds_cell = Rc::new(Cell::new(Bounds::default()));
+        let paint_bounds = bounds_cell.clone();
+
+        div().id("editor-minimap").w(px(140.)).h_full().min_h_0()
+            .flex_shrink_0().flex().flex_col().overflow_hidden()
+            .bg(rgb(0x101724)).border_l_1().border_color(rgb(0x35445b))
+            .child(div().px_2().py_1().text_xs().text_color(rgb(0xa8bbd5))
+                .child("MINIMAP · 滚动/拖拽/定位"))
+            .child(div().id("minimap-canvas").relative().flex_1().min_h_0()
+                .cursor_pointer().overflow_hidden()
+                .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
+                    let delta_lines = match event.delta {
+                        ScrollDelta::Lines(p) => -p.y * 4.0,
+                        ScrollDelta::Pixels(p) => -f32::from(p.y) / 16.0,
+                    };
+                    let input = this.input.read(cx);
+                    let current_line = input.cursor_position().line as f32;
+                    let total_lines = input.text().lines_len().max(1);
+                    let new_line = (current_line + delta_lines).round().clamp(0.0, (total_lines - 1) as f32) as usize;
+                    this.input.update(cx, |state, cx| {
+                        state.set_cursor_position(gpui_component::input::Position {
+                            line: new_line as u32,
+                            character: 0,
+                        }, window, cx);
+                        state.focus(window, cx);
+                    });
+                    cx.notify();
+                }))
+                .on_mouse_down(MouseButton::Left, cx.listener({
+                    let bounds_cell = bounds_cell.clone();
+                    move |this, event: &MouseDownEvent, window, cx| {
+                        this.minimap_dragging = true;
+                        let bounds = bounds_cell.get();
+                        let height = f32::from(bounds.size.height);
+                        let total_lines = this.input.read(cx).text().lines_len().max(1);
+                        let cursor_line = this.input.read(cx).cursor_position().line as usize;
+                        let scroll_info = calculate_minimap_scroll(cursor_line, total_lines, height, MINIMAP_LINE_HEIGHT);
+                        let y = f32::from(event.position.y - bounds.origin.y);
+                        let target_line = minimap_coord_to_line(y, scroll_info.scroll_y, MINIMAP_LINE_HEIGHT, total_lines);
+                        this.input.update(cx, |state, cx| {
+                            state.set_cursor_position(gpui_component::input::Position {
+                                line: target_line as u32,
+                                character: 0,
+                            }, window, cx);
+                            state.focus(window, cx);
+                        });
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_move(cx.listener({
+                    let bounds_cell = bounds_cell.clone();
+                    move |this, event: &MouseMoveEvent, window, cx| {
+                        if !this.minimap_dragging {
+                            return;
+                        }
+                        let bounds = bounds_cell.get();
+                        let height = f32::from(bounds.size.height);
+                        let total_lines = this.input.read(cx).text().lines_len().max(1);
+                        let cursor_line = this.input.read(cx).cursor_position().line as usize;
+                        let scroll_info = calculate_minimap_scroll(cursor_line, total_lines, height, MINIMAP_LINE_HEIGHT);
+                        let y = f32::from(event.position.y - bounds.origin.y);
+                        let target_line = minimap_coord_to_line(y, scroll_info.scroll_y, MINIMAP_LINE_HEIGHT, total_lines);
+                        this.input.update(cx, |state, cx| {
+                            state.set_cursor_position(gpui_component::input::Position {
+                                line: target_line as u32,
+                                character: 0,
+                            }, window, cx);
+                            state.focus(window, cx);
+                        });
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if this.minimap_dragging {
+                        this.minimap_dragging = false;
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if this.minimap_dragging {
+                        this.minimap_dragging = false;
+                        cx.notify();
+                    }
+                }))
+                .child(canvas(move |bounds, _, _| {
+                    paint_bounds.set(bounds);
+                }, move |bounds, _, window, _| {
+                    let height = f32::from(bounds.size.height);
+                    let scroll_info = calculate_minimap_scroll(cursor, total, height, MINIMAP_LINE_HEIGHT);
+                    let mut paint = |x: f32, y: f32, w: f32, h: f32, color: Hsla| {
+                        if y + h >= 0.0 && y <= height {
+                            window.paint_quad(fill(Bounds::new(
+                                point(bounds.origin.x + px(x), bounds.origin.y + px(y)),
+                                size(px(w), px(h))), color));
+                        }
+                    };
+
+                    paint(0., scroll_info.slider_y, 140., scroll_info.slider_height, rgba(0x7898c12a).into());
+                    paint(0., scroll_info.slider_y, 140., 1.0, rgba(0xa0c0e844).into());
+                    paint(0., scroll_info.slider_y + scroll_info.slider_height - 1.0, 140., 1.0, rgba(0xa0c0e844).into());
+
+                    for row in scroll_info.visible_range {
+                        if let Some(segments) = samples.get(row) {
+                            let y = (row as f32 * MINIMAP_LINE_HEIGHT) - scroll_info.scroll_y;
+                            for &(x, width, color) in segments {
+                                paint(6. + x, y, width, 1.6, rgb(color).into());
+                            }
+                        }
+                    }
+
+                    let cursor_render_y = (cursor as f32 * MINIMAP_LINE_HEIGHT) - scroll_info.scroll_y;
+                    if cursor_render_y >= 0.0 && cursor_render_y <= height {
+                        paint(0., cursor_render_y, 4., 2.4, rgb(0x83c9ff).into());
+                    }
+                }).size_full()))
+    }
+
     fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
         self.save(false, window, cx);
     }
@@ -937,11 +1250,15 @@ impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dirty = self.dirty_cached;
         let name = self.document_name(self.active_tab);
-        window.set_window_title(&format!(
+        let title = format!(
             "{}{} — Ferrite 文本编辑器",
             if dirty { "● " } else { "" },
             name
-        ));
+        );
+        if self.last_window_title != title {
+            window.set_window_title(&title);
+            self.last_window_title = title;
+        }
         let lines = self.lines;
         let chars = self.chars;
         div()
@@ -957,6 +1274,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::toggle_tree))
+            .on_action(cx.listener(Self::toggle_minimap))
             .on_action(cx.listener(Self::refresh_tree))
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))
@@ -978,6 +1296,9 @@ impl Render for Editor {
                     )
                     .child(tool("toggle-tree", "文件树").on_click(
                         cx.listener(|this, _, w, cx| this.toggle_tree(&ToggleTree, w, cx)),
+                    ))
+                    .child(tool("toggle-minimap", if self.minimap_visible { "缩略图 ●" } else { "缩略图 ○" }).on_click(
+                        cx.listener(|this, _, w, cx| this.toggle_minimap(&ToggleMinimap, w, cx)),
                     ))
                     .child(
                         tool("new", "新建  Ctrl+N")
@@ -1013,13 +1334,20 @@ impl Render for Editor {
                             .h_full()
                             .child(self.tab_bar(cx))
                             .child(
-                                div().flex_1().min_h_0().px_3().pb_2().child(
-                                    Input::new(&self.input)
-                                        .h_full()
-                                        .appearance(false)
-                                        .font_family("Cascadia Code")
-                                        .text_size(px(16.)),
-                                ),
+                                div()
+                                    .flex()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(
+                                        div().flex_1().min_w_0().min_h_0().overflow_hidden().px_3().pb_2().child(
+                                            Input::new(&self.input)
+                                                .h_full()
+                                                .appearance(false)
+                                                .font_family("Cascadia Code")
+                                                .text_size(px(16.)),
+                                        ),
+                                    )
+                                    .children(self.minimap_visible.then(|| self.minimap_panel(cx))),
                             ),
                     ),
             )
@@ -1082,6 +1410,7 @@ fn main() {
             KeyBinding::new("ctrl-shift-s", SaveAs, None),
             KeyBinding::new("ctrl-shift-o", OpenFolder, None),
             KeyBinding::new("ctrl-b", ToggleTree, None),
+            KeyBinding::new("ctrl-m", ToggleMinimap, None),
             KeyBinding::new("ctrl-w", CloseTab, None),
             KeyBinding::new("ctrl-tab", NextTab, None),
             KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
@@ -1148,7 +1477,21 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_tree_scroll_offset, decode_text, detect_language, encode_text};
+    use super::{calculate_minimap_scroll, calculate_minimap_viewport, calculate_tree_scroll_offset, decode_text, detect_language, encode_text, minimap_click_to_line, minimap_coord_to_line, minimap_segments, MINIMAP_LINE_HEIGHT};
+    #[test]
+    fn minimap_merges_runs_and_bounds_scene_size() {
+        let merged = minimap_segments("    abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0, 5.0);
+        assert!(merged[0].1 > 30.0);
+        assert!(minimap_segments(" \t ").is_empty());
+        let adversarial = "a1{} ".repeat(40);
+        let spans = minimap_segments(&adversarial);
+        assert!(spans.len() <= 16);
+        assert!(spans.iter().all(|(x, w, _)| *x >= 0.0 && *w > 0.0 && x + w <= 125.0));
+        assert!(!minimap_segments("    中文🙂").is_empty());
+    }
+
     #[test]
     fn startup_accepts_multiple_files() {
         let paths = super::startup_paths(["editor.exe".into(), "一.md".into(), "two.rs".into()]);
@@ -1366,6 +1709,20 @@ mod tests {
     }
 
         #[test]
+    fn minimap_segments_and_click_mapping_behave_properly() {
+        let segs = minimap_segments("    let x = 42; // note");
+        assert!(!segs.is_empty(), "minimap strokes should not be empty");
+        let first = segs[0];
+        assert!(first.0 >= 4.0 * 1.25, "indentation should be preserved in coordinates");
+
+        let line = minimap_click_to_line(50.0, 100.0, 100);
+        assert_eq!(line, 50, "middle click maps to middle line");
+
+        let (start, end) = calculate_minimap_viewport(10, 100, 20);
+        assert!(start <= 10 && end >= 10, "viewport window includes cursor");
+    }
+
+    #[test]
     fn tree_scroll_offset_centers_out_of_view_row_and_keeps_in_view_stable() {
         const ROW_HEIGHT: f32 = 28.0;
         const VIEWPORT_H: f32 = 600.0;
@@ -1469,6 +1826,57 @@ mod tests {
         assert_eq!(expanded_rows.len(), 4); // folder_a, file_1.txt, sub_folder, folder_b
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+
+    #[test]
+    fn minimap_scroll_calculation_handles_short_and_long_documents() {
+        const VIEWPORT_H: f32 = 600.0;
+
+        // 1. 短文档 (50 行，内容高度 50 * 2.4 = 120px < 600px)
+        let short_info = calculate_minimap_scroll(10, 50, VIEWPORT_H, MINIMAP_LINE_HEIGHT);
+        assert_eq!(short_info.scroll_y, 0.0, "短文档 Minimap 无需滚动");
+        assert_eq!(short_info.visible_range, 0..50, "短文档全部行可见");
+        assert!(short_info.slider_y >= 0.0);
+        assert!(short_info.slider_y + short_info.slider_height <= VIEWPORT_H);
+
+        // 2. 超长文档 (2000 行，内容高度 2000 * 2.4 = 4800px > 600px)
+        // 顶部光标
+        let top_info = calculate_minimap_scroll(0, 2000, VIEWPORT_H, MINIMAP_LINE_HEIGHT);
+        assert_eq!(top_info.scroll_y, 0.0, "顶部光标时 Minimap 处于最顶端");
+        assert_eq!(top_info.visible_range.start, 0);
+        assert!(top_info.visible_range.end <= 260);
+
+        // 底部光标
+        let bottom_info = calculate_minimap_scroll(1999, 2000, VIEWPORT_H, MINIMAP_LINE_HEIGHT);
+        let max_scroll = 4800.0 - VIEWPORT_H; // 4200.0
+        assert_eq!(bottom_info.scroll_y, max_scroll, "底部光标时 Minimap 滚至最底端");
+        assert_eq!(bottom_info.visible_range.end, 2000);
+        assert_eq!(bottom_info.slider_y + bottom_info.slider_height, VIEWPORT_H);
+
+        // 中间光标 (第 1000 行)
+        let mid_info = calculate_minimap_scroll(1000, 2000, VIEWPORT_H, MINIMAP_LINE_HEIGHT);
+        assert!((mid_info.scroll_y - max_scroll * 0.5).abs() < 5.0, "中间光标时平滑居中");
+        assert!(mid_info.visible_range.contains(&1000));
+    }
+
+    #[test]
+    fn minimap_coord_to_line_and_drag_bounds_clamping() {
+        const TOTAL_LINES: usize = 1000;
+        let line_height = MINIMAP_LINE_HEIGHT; // 2.4
+
+        // 无滚动时直接点击
+        assert_eq!(minimap_coord_to_line(0.0, 0.0, line_height, TOTAL_LINES), 0);
+        assert_eq!(minimap_coord_to_line(24.0, 0.0, line_height, TOTAL_LINES), 10);
+
+        // 包含滚动偏移时点击
+        let scroll_y = 1200.0; // 相当于滚动了 500 行
+        let line = minimap_coord_to_line(24.0, scroll_y, line_height, TOTAL_LINES);
+        assert_eq!(line, 510);
+
+        // 上下越界安全保护
+        assert_eq!(minimap_coord_to_line(-100.0, 0.0, line_height, TOTAL_LINES), 0);
+        assert_eq!(minimap_coord_to_line(10000.0, scroll_y, line_height, TOTAL_LINES), 999);
     }
 
     #[test]
