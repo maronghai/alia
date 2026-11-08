@@ -1,0 +1,96 @@
+# alia
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-2024%20Edition-orange.svg)](Cargo.toml)
+[![UI: GPUI](https://img.shields.io/badge/GUI-GPUI%200.2.2-green.svg)](Cargo.toml)
+
+**alia** 是一款使用 **Rust** 和 **GPUI** 开发的高性能 Windows 原生桌面文本编辑器。它结合 GPU 加速渲染与状态驱动的编辑器架构，为代码和文档编辑提供现代、流畅的使用体验。
+
+[English README](README.md)
+
+---
+
+## 核心特性
+
+- **GPU 加速渲染**：基于 GPUI 渲染流水线，提供响应迅速的布局、文本渲染和界面更新。
+- **多标签页文档管理**：
+  - 支持同时打开和切换多个文档。
+  - 通过规范化路径比较避免同一文件重复打开。
+  - 关闭标签页或退出程序时保护未保存修改。
+- **项目资源管理器**：
+  - 浏览层级目录，支持展开和折叠。
+  - 使用虚拟化文件树，保持大量文件时的流畅性。
+  - 切换标签页时自动让当前文件保持可见并居中显示。
+- **代码缩略图 Minimap**：
+  - 以紧凑视图显示缩进、空行和代码轮廓。
+  - 与编辑区视口同步，适配长文档和短文档。
+  - 支持鼠标滚轮导航和按住鼠标拖动定位。
+  - 使用 `Ctrl + M` 显示或隐藏。
+- **多语言语法高亮**：
+  - 基于 Tree-sitter 增量语法解析。
+  - 支持 30 多种常见语言和格式，包括 Rust、C/C++、Go、Python、TypeScript/JavaScript、HTML/CSS、JSON、YAML、Markdown 和 SQL。
+  - 在多个文档之间共享解析器实例，减少不必要的内存分配。
+- **Windows 集成与可靠 I/O**：
+  - 使用无损的 `args_os` 解析，支持 Unicode 路径、包含空格的路径以及文件关联启动。
+  - 在独立工作线程中运行原生文件对话框，避免 Win32 COM STA 与 GPUI UI 线程之间的重入问题。
+  - 保留 UTF-8 BOM 标记以及 CRLF/LF 换行风格。
+
+---
+
+## 常用快捷键
+
+| 快捷键 | 功能 |
+| :--- | :--- |
+| `Ctrl + N` | 新建标签页和文档 |
+| `Ctrl + O` | 打开文件，支持多选 |
+| `Ctrl + Shift + O` | 打开文件夹并设置为资源管理器根目录 |
+| `Ctrl + S` | 保存当前文档 |
+| `Ctrl + Shift + S` | 将当前文档另存为新文件 |
+| `Ctrl + W` | 关闭当前标签页 |
+| `Ctrl + Tab` | 切换到下一个标签页 |
+| `Ctrl + Shift + Tab` | 切换到上一个标签页 |
+| `Ctrl + B` | 显示或隐藏资源管理器 |
+| `Ctrl + M` | 显示或隐藏 Minimap |
+| `Ctrl + F` | 打开查找和替换面板 |
+
+---
+
+## 构建与运行
+
+### 环境要求
+
+- **Rust**：1.85 或更高版本，建议使用 stable 工具链。
+- **C++ 构建工具**：Windows 下需要 MSVC 或兼容的 C++ 工具链，用于编译 Tree-sitter C 语法解析器。
+
+### 运行开发构建
+
+```bash
+cargo run --bin alia
+```
+
+### 运行测试
+
+```bash
+cargo test --bin alia
+```
+
+### 构建正式版本
+
+```bash
+cargo build --release --bin alia
+```
+
+正式版可执行文件生成在 `target/release/alia.exe`。
+
+---
+
+## 架构与工程实践文档
+
+- [ADR.md](ADR.md)：架构决策记录，涵盖框架选型、Win32 COM 解耦、虚拟化资源管理器、标签页联动和 Minimap 交互设计。
+- [rust-gpui-skill.md](rust-gpui-skill.md)：Rust 与 GPUI 桌面端开发经验、排错方法、避坑指南和面试考点。
+
+---
+
+## 开源协议
+
+本项目采用 [MIT License](LICENSE) 开源。
