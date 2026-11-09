@@ -750,3 +750,7 @@ let y = content_top + row as f32 * line_height - column_scroll_y;
 本次保持 column_cursors_overlay 及 column_caret_bounds 坐标和尺寸实现不变。测试增加连续扩展十行后批量插入/删除，以及向上跨锚点和文档边界约束；GUI 实测结果以本轮最终汇报为准。
 
 本轮验证结果：36 项测试通过；桌面实测 Shift+Down 从两行扩展至四行，物理 x 按键同时修改四行，列光标随输入向右移动。十行连续扩展及批量插入/删除由自动化测试覆盖。桌面文字注入（输入法提交路径）仍只修改主行，属于未修复的独立限制。原 alia.exe 被运行进程占用，因此本次构建交付 alia-column.exe，保留原窗口。
+
+### 列编辑的 Home/End 与按词选择
+
+已绑定的按键通常先派发 Action；只补 KeyDown 分支不足以支持 Home/End 和 Ctrl+Shift+方向键。须在父容器 capture_action 中更新矩形选区并停止传播。选区需记录方向，才能从右向左选择、缩回、越过锚点；几何测量仍复用 Input 的真实布局。矩形模式以主操作行词边界为准，不等同于逐行独立多选区。38 项测试通过；本轮未实测界面。

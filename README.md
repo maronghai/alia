@@ -99,3 +99,7 @@ The release executable is generated at `target/release/alia.exe`.
 ## License
 
 This project is released under the [MIT License](LICENSE).
+
+### Column navigation
+
+In Column Mode, Home moves to column zero; End and Ctrl+Left/Right use the active row as the boundary reference for the entire rectangle. Hold Shift to extend the selection (including to the left). Typing replaces the rectangle on all selected rows. Mouse double-click word selection is not integrated with column mode.

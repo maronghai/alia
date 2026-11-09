@@ -99,3 +99,7 @@ cargo build --release --bin alia
 ## 开源协议
 
 本项目采用 [MIT License](LICENSE) 开源。
+
+### 列编辑导航
+
+列模式下 Home 移至第 0 列；End、Ctrl+左右方向键以主操作行的行尾或词边界为基准移动整组光标。按住 Shift 可向两侧扩展矩形选区，输入会替换所有选中行的矩形范围。鼠标双击选词尚未与列模式联动。

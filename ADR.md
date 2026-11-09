@@ -490,3 +490,7 @@ GPUI 会优先把 Tab 和 Shift-Tab 匹配为 `InputState` 的 `IndentInline` �
 本次保持 column_cursors_overlay 及 column_caret_bounds 坐标和尺寸实现不变。测试增加连续扩展十行后批量插入/删除，以及向上跨锚点和文档边界约束；GUI 实测结果以本轮最终汇报为准。
 
 本轮验证结果：36 项测试通过；桌面实测 Shift+Down 从两行扩展至四行，物理 x 按键同时修改四行，列光标随输入向右移动。十行连续扩展及批量插入/删除由自动化测试覆盖。桌面文字注入（输入法提交路径）仍只修改主行，属于未修复的独立限制。原 alia.exe 被运行进程占用，因此本次构建交付 alia-column.exe，保留原窗口。
+
+### 列编辑导航补充（2026-11-10）
+
+捕获 MoveHome、MoveEnd、SelectToStartOfLine、SelectToEndOfLine 及四种词级移动/选择 Action，避免被单光标组件单独处理。矩形模式采用主操作行的边界作为整组目标列；增加反向选区状态，保持固定锚点。光标几何继续使用已校准的 column_caret_bounds 接口。38 项测试通过，未做本轮桌面交互验收。
