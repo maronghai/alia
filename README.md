@@ -53,6 +53,10 @@
 | `Ctrl + B` | Show or hide the Explorer |
 | `Ctrl + M` | Show or hide the minimap |
 | `Ctrl + F` | Open the find and replace panel |
+| `Alt + C` | Toggle column editing (starts with the current and next row) |
+| `Shift + Up / Down` | Extend the row range while in column mode |
+| `Alt + Shift + Up / Down` or `Ctrl + Alt + Up / Down` | Add or extend column carets |
+| `Shift + Left / Right` | Adjust the rectangular selection width in column mode |
 
 ---
 

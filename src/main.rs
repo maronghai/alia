@@ -1,9 +1,10 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![recursion_limit = "256"]
 
 use gpui::*;
 use gpui_component::{
     Root, Theme, ThemeMode,
-    input::{Input, InputEvent, InputState, RopeExt},
+    input::{Backspace, Delete, IndentInline, Input, InputEvent, InputState, OutdentInline, Position, RopeExt},
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::{
@@ -24,12 +25,333 @@ actions!(
         OpenFolder,
         ToggleTree,
         ToggleMinimap,
-        RefreshTree,
+        RefreshTree
+    ]
+);
+
+actions!(
+    tabs,
+    [
         CloseTab,
         NextTab,
         PreviousTab
     ]
 );
+
+actions!(
+    column,
+    [
+        ToggleColumnMode,
+        ColumnExtendDown,
+        ColumnExtendUp,
+        ColumnExtendRight,
+        ColumnExtendLeft,
+        ColumnShiftLeft,
+        ColumnShiftRight,
+        ColumnShiftUp,
+        ColumnShiftDown,
+        ColumnEscape
+    ]
+);
+
+actions!(
+    navigation,
+    [
+        GoToLine,
+        GoToLineEscape
+    ]
+);
+
+
+/// Parse 1-based target line number for Go-To-Line functionality
+pub fn parse_target_line(input: &str, max_lines: usize) -> Option<usize> {
+    let clean = input.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let clean = clean.trim_start_matches(':').trim_start_matches('L').trim_start_matches('l').trim();
+    clean.parse::<usize>().ok().map(|line| {
+        if line == 0 {
+            0
+        } else {
+            line.saturating_sub(1).min(max_lines.saturating_sub(1))
+        }
+    })
+}
+
+/// Determine icon and color for tree explorer items (VSCode / Sublime style)
+pub fn file_badge_and_color(name: &str, is_dir: bool, expanded: bool) -> (&'static str, &'static str, u32) {
+    if is_dir {
+        if expanded {
+            ("▾", "📂", 0xf59e0b) // amber
+        } else {
+            ("▸", "📁", 0xf59e0b) // amber
+        }
+    } else {
+        let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        match ext.as_str() {
+            "rs" => ("", "🦀", 0xf97316),       // Rust orange
+            "md" | "markdown" => ("", "📝", 0x818cf8), // Markdown indigo
+            "toml" | "json" | "yaml" | "yml" => ("", "⚙", 0xfacc15), // Config yellow
+            "js" | "ts" | "jsx" | "tsx" | "html" | "css" => ("", "🌐", 0x38bdf8), // Web sky-blue
+            "py" => ("", "🐍", 0x3b82f6),       // Python blue
+            "c" | "cpp" | "h" | "hpp" => ("", "⚡", 0x60a5fa), // C/C++ blue
+            "txt" | "log" => ("", "📄", 0x94a3b8), // Plain slate
+            _ => ("", "📄", 0x94a3b8),          // Generic slate
+        }
+    }
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnSelection {
+    pub anchor_line: usize,
+    pub anchor_col: usize,
+    pub head_line: usize,
+    pub head_col: usize,
+}
+
+impl ColumnSelection {
+    pub fn new(anchor_line: usize, anchor_col: usize, head_line: usize, head_col: usize) -> Self {
+        Self { anchor_line, anchor_col, head_line, head_col }
+    }
+    pub fn line_range(self) -> (usize, usize) {
+        (self.anchor_line.min(self.head_line), self.anchor_line.max(self.head_line))
+    }
+    pub fn column_range(self) -> (usize, usize) {
+        (self.anchor_col.min(self.head_col), self.anchor_col.max(self.head_col))
+    }
+    pub fn is_empty(self) -> bool {
+        self.anchor_line == self.head_line && self.anchor_col == self.head_col
+    }
+}
+
+pub fn column_selection_rows(selection: ColumnSelection, total_lines: usize) -> std::ops::RangeInclusive<usize> {
+    let (start, end) = selection.line_range();
+    start.min(total_lines.saturating_sub(1))..=end.min(total_lines.saturating_sub(1))
+}
+
+/// Advance the selection head by one row, preserving its anchor and document bounds.
+fn extended_column_head(head: usize, total_lines: usize, down: bool) -> usize {
+    let last = total_lines.saturating_sub(1);
+    if down { head.saturating_add(1).min(last) } else { head.saturating_sub(1).min(last) }
+}
+
+/// Character-based navigation for a rectangular selection's active row.
+#[derive(Clone, Copy)]
+enum ColumnNavigation { Home, End, PreviousWord, NextWord }
+fn column_navigation_target(text: &str, column: usize, navigation: ColumnNavigation) -> usize {
+    let chars: Vec<char> = text.trim_end_matches(['\r', '\n']).chars().collect();
+    let mut at = column.min(chars.len());
+    let class = |c: char| if c.is_whitespace() { 0 } else if c.is_alphanumeric() || c == '_' { 1 } else { 2 };
+    match navigation {
+        ColumnNavigation::Home => 0,
+        ColumnNavigation::End => chars.len(),
+        ColumnNavigation::PreviousWord => {
+            while at > 0 && chars[at-1].is_whitespace() { at -= 1; }
+            if at > 0 { let kind = class(chars[at-1]); while at > 0 && class(chars[at-1]) == kind { at -= 1; } }
+            at
+        }
+        ColumnNavigation::NextWord => {
+            if at < chars.len() { let kind = class(chars[at]); while at < chars.len() && class(chars[at]) == kind { at += 1; } }
+            while at < chars.len() && chars[at].is_whitespace() { at += 1; }
+            at
+        }
+    }
+}
+fn column_range_after_navigation(left: usize, width: usize, reversed: bool, target: usize, select: bool) -> (usize, usize, bool) {
+    if !select { return (target, 0, false); }
+    let anchor = if reversed { left + width } else { left };
+    (anchor.min(target), anchor.abs_diff(target), target < anchor)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnCursorRowMetrics {
+    pub row: usize,
+    pub caret_x: f32,
+    pub box_x: f32,
+    pub box_width: f32,
+    pub y: f32,
+    pub height: f32,
+    pub is_primary: bool,
+}
+
+/// Calculate multi-cursor visual positions for each edited row in column mode
+pub fn calculate_column_cursors(
+    start_line: usize,
+    end_line: usize,
+    col: usize,
+    box_width: usize,
+    input_len: usize,
+    char_width: f32,
+    line_number_width: f32,
+    line_height: f32,
+    primary_line: usize,
+    viewport_y_offset: f32,
+) -> Vec<ColumnCursorRowMetrics> {
+    let min_line = start_line.min(end_line);
+    let max_line = start_line.max(end_line);
+    let effective_caret_col = col + box_width + input_len;
+    let box_x = line_number_width + (col as f32) * char_width;
+    let caret_x = line_number_width + (effective_caret_col as f32) * char_width;
+    let box_pixel_width = (box_width as f32) * char_width;
+    let mut rows = Vec::with_capacity(max_line - min_line + 1);
+
+    for row in min_line..=max_line {
+        let y = viewport_y_offset + (row as f32) * line_height;
+        rows.push(ColumnCursorRowMetrics {
+            row,
+            caret_x,
+            box_x,
+            box_width: box_pixel_width,
+            y,
+            height: line_height,
+            is_primary: row == primary_line,
+        });
+    }
+    rows
+}
+
+// Column editing pure algorithms
+pub fn apply_column_insert(
+    original: &str,
+    start_line: usize,
+    end_line: usize,
+    col: usize,
+    width: usize,
+    insert_text: &str,
+) -> String {
+    let crlf = original.contains("\r\n");
+    let normalized = original.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let min_line = start_line.min(end_line);
+    let max_line = start_line.max(end_line).min(lines.len().saturating_sub(1));
+
+    let mut out_lines = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i >= min_line && i <= max_line {
+            let mut chars: Vec<char> = line.chars().collect();
+            if chars.len() < col {
+                chars.extend(std::iter::repeat(' ').take(col - chars.len()));
+            }
+            let left: String = chars[..col].iter().collect();
+            let right_start = (col + width).min(chars.len());
+            let right: String = chars[right_start..].iter().collect();
+            out_lines.push(format!("{}{}{}", left, insert_text, right));
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    let sep = if crlf { "\r\n" } else { "\n" };
+    out_lines.join(sep)
+}
+
+pub fn apply_column_numbers(
+    original: &str,
+    start_line: usize,
+    end_line: usize,
+    col: usize,
+    width: usize,
+    start_num: i64,
+    step: i64,
+    zero_pad: usize,
+) -> String {
+    let crlf = original.contains("\r\n");
+    let normalized = original.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let min_line = start_line.min(end_line);
+    let max_line = start_line.max(end_line).min(lines.len().saturating_sub(1));
+
+    let mut out_lines = Vec::with_capacity(lines.len());
+    let mut step_idx = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if i >= min_line && i <= max_line {
+            let num = start_num + step_idx * step;
+            step_idx += 1;
+            let num_str = if zero_pad > 0 {
+                format!("{:0width$}", num, width = zero_pad)
+            } else {
+                format!("{}", num)
+            };
+            let mut chars: Vec<char> = line.chars().collect();
+            if chars.len() < col {
+                chars.extend(std::iter::repeat(' ').take(col - chars.len()));
+            }
+            let left: String = chars[..col].iter().collect();
+            let right_start = (col + width).min(chars.len());
+            let right: String = chars[right_start..].iter().collect();
+            out_lines.push(format!("{}{}{}", left, num_str, right));
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    let sep = if crlf { "\r\n" } else { "\n" };
+    out_lines.join(sep)
+}
+
+pub fn apply_column_delete(
+    original: &str,
+    start_line: usize,
+    end_line: usize,
+    col: usize,
+    width: usize,
+) -> String {
+    let actual_width = if width == 0 { 1 } else { width };
+    apply_column_insert(original, start_line, end_line, col, actual_width, "")
+}
+
+
+pub fn apply_column_outdent(
+    original: &str,
+    start_line: usize,
+    end_line: usize,
+    col: usize,
+    tab_size: usize,
+) -> (String, usize) {
+    if col == 0 || tab_size == 0 {
+        return (original.to_string(), 0);
+    }
+    let crlf = original.contains("\r\n");
+    let normalized = original.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let min_line = start_line.min(end_line);
+    let max_line = end_line.max(start_line).min(lines.len().saturating_sub(1));
+    let remove_limit = tab_size.min(col);
+    let mut removed = remove_limit;
+    for (i, line) in lines.iter().enumerate() {
+        if i < min_line || i > max_line {
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut count = 0;
+        while count < remove_limit && col > count && col - count - 1 < chars.len() && chars[col - count - 1] == ' ' {
+            count += 1;
+        }
+        removed = removed.min(count);
+    }
+    if removed == 0 {
+        return (original.to_string(), 0);
+    }
+    let mut out_lines = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i < min_line || i > max_line {
+            out_lines.push((*line).to_string());
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let cut = removed.min(col);
+        let left: String = chars[..col.saturating_sub(cut).min(chars.len())].iter().collect();
+        let right: String = if col < chars.len() {
+            chars[col..].iter().collect()
+        } else {
+            String::new()
+        };
+        out_lines.push(format!("{}{}", left, right));
+    }
+    let sep = if crlf { "\r\n" } else { "\n" };
+    (out_lines.join(sep), removed)
+}
+
 
 // Native modal dialogs pump Windows messages. Running them inside a GPUI
 // entity update can re-enter the UI while it is mutably borrowed. Keep their
@@ -322,6 +644,15 @@ struct Editor {
     message: String,
     last_window_title: String,
     tab_context_menu: Option<TabContextMenu>,
+    column_mode: bool,
+    column_start_line: usize,
+    column_end_line: usize,
+    column_col: usize,
+    column_width: usize,
+    column_reversed: bool,
+    /// Vertical content offset mirrored from the editor viewport while column mode is active.
+    goto_line_open: bool,
+    goto_line_input: Entity<InputState>,
 }
 
 impl std::ops::Deref for Editor {
@@ -487,6 +818,17 @@ impl Editor {
             message: "Ready".into(),
             last_window_title: String::new(),
             tab_context_menu: None,
+            column_mode: false,
+            column_start_line: 0,
+            column_end_line: 0,
+            column_col: 0,
+            column_width: 0,
+            column_reversed: false,
+            goto_line_open: false,
+            goto_line_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Go to line (e.g. 42, press Enter)...")
+            }),
         };
         editor.rebuild_flattened_tree();
         editor
@@ -795,6 +1137,13 @@ impl Editor {
                             this.open_tab_context_menu(index, event.position, w, cx);
                         }),
                     )
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _, w, cx| {
+                            cx.stop_propagation();
+                            this.close_tab_at(index, w, cx);
+                        }),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -816,6 +1165,22 @@ impl Editor {
                             })),
                     )
             }))
+            .child(
+                div()
+                    .id("tab-bar-empty-area")
+                    .flex_1()
+                    .h_full()
+                    .min_w(px(80.))
+                    .cursor_default()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, w, cx| {
+                            if event.click_count >= 2 {
+                                this.new_file(&NewFile, w, cx);
+                            }
+                        }),
+                    ),
+            )
     }
 
     fn context_menu_item(
@@ -860,6 +1225,147 @@ impl Editor {
                 .cursor_not_allowed()
                 .child(label)
         }
+    }
+
+
+    fn toggle_bom_active(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.bom = !self.bom;
+        self.dirty_cached = true;
+        self.message = if self.bom {
+            "Encoding changed: UTF-8 with BOM (Bompad)".into()
+        } else {
+            "Encoding changed: UTF-8 without BOM".into()
+        };
+        cx.notify();
+    }
+
+    fn toggle_crlf_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let new_crlf = !self.crlf;
+        let current_text = self.text(cx);
+        let converted = if new_crlf {
+            current_text.replace("\r\n", "\n").replace('\n', "\r\n")
+        } else {
+            current_text.replace("\r\n", "\n")
+        };
+        self.crlf = new_crlf;
+        self.input.update(cx, |state, cx| {
+            state.set_value(converted, window, cx);
+        });
+        self.dirty_cached = true;
+        self.message = if new_crlf {
+            "Line endings: CRLF (Windows)".into()
+        } else {
+            "Line endings: LF (Unix)".into()
+        };
+        cx.notify();
+    }
+
+    fn open_goto_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.goto_line_open = true;
+        let total = self.lines;
+        let current_line = self.input.read(cx).cursor_position().line + 1;
+        self.goto_line_input.update(cx, |state, cx| {
+            state.set_value(format!("{}", current_line), window, cx);
+            state.focus(window, cx);
+        });
+        self.message = format!("Go to line (1..{})", total);
+        cx.notify();
+    }
+
+    fn close_goto_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.goto_line_open {
+            self.goto_line_open = false;
+            self.input.update(cx, |state, cx| state.focus(window, cx));
+            cx.notify();
+        }
+    }
+
+    fn apply_goto_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let val = self.goto_line_input.read(cx).value().to_string();
+        if let Some(target_line) = parse_target_line(&val, self.lines) {
+            self.input.update(cx, |state, cx| {
+                state.set_cursor_position(Position { line: target_line as u32, character: 0 }, window, cx);
+                state.focus(window, cx);
+            });
+            self.message = format!("Jumped to line {}", target_line + 1);
+            self.goto_line_open = false;
+            cx.notify();
+        } else {
+            self.message = "Invalid line number".into();
+            cx.notify();
+        }
+    }
+
+    fn goto_line_panel(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let total_lines = self.lines;
+        deferred(
+            anchored()
+                .position(Point::new(px(0.), px(0.)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .size_full()
+                        .bg(rgba(0x00000066))
+                        .flex()
+                        .justify_center()
+                        .items_start()
+                        .pt(px(40.))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, w, cx| {
+                                this.close_goto_line(w, cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(px(460.))
+                                .bg(rgb(0x1a1e28))
+                                .border_1()
+                                .border_color(rgb(0x3b82f6))
+                                .rounded(px(6.))
+                                .shadow_lg()
+                                .p_3()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .mb_2()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(rgb(0x60a5fa))
+                                                .child(format!("GO TO LINE : (1 .. {})", total_lines)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x94a3b8))
+                                                .child("Press Enter to jump, Esc to cancel"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, w, cx| {
+                                            if event.keystroke.key == "enter" {
+                                                this.apply_goto_line(w, cx);
+                                            } else if event.keystroke.key == "escape" {
+                                                this.close_goto_line(w, cx);
+                                            }
+                                        }))
+                                        .child(
+                                            Input::new(&self.goto_line_input)
+                                                .appearance(true)
+                                                .cleanable(false)
+                                                .font_family("Cascadia Code")
+                                                .text_size(px(14.)),
+                                        ),
+                                ),
+                        ),
+                ),
+        )
     }
 
     fn tab_context_menu_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1245,21 +1751,14 @@ impl Editor {
                                     let is_dir = entry.directory;
                                     let expanded = entry.expanded;
                                     let entry_path = entry.path.clone();
-                                    let label = format!(
-                                        "{} {}",
-                                        if is_dir {
-                                            if expanded { "▾" } else { "▸" }
-                                        } else {
-                                            "·"
-                                        },
-                                        entry.name
-                                    );
+                                    let (prefix, icon, icon_color) = file_badge_and_color(&entry.name, is_dir, expanded);
 
                                     items.push(
                                         div()
                                             .id(("file-tree-row", index))
                                             .h(px(28.))
-                                            .line_height(px(28.))
+                                            .flex()
+                                            .items_center()
                                             .pl(px(12. + entry.depth as f32 * 16.))
                                             .pr_2()
                                             .text_sm()
@@ -1268,7 +1767,18 @@ impl Editor {
                                             .bg(rgb(if active { 0x232a3b } else { 0x151821 }))
                                             .text_color(rgb(if active { 0xf8fafc } else { 0xcbd5e1 }))
                                             .hover(|style| style.bg(rgb(0x1c202c)))
-                                            .child(label)
+                                            .border_l_2()
+                                            .border_color(rgb(if active { 0x3b82f6 } else { 0x151821 }))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    .overflow_hidden()
+                                                    .child(div().text_xs().text_color(rgb(0x94a3b8)).child(prefix))
+                                                    .child(div().text_sm().text_color(rgb(icon_color)).child(icon))
+                                                    .child(div().overflow_hidden().text_ellipsis().child(entry.name.clone())),
+                                            )
                                             .on_click(cx.listener(move |this, _, w, cx| {
                                                 if is_dir {
                                                     this.toggle_folder(&entry_path, cx);
@@ -1522,6 +2032,24 @@ fn encode_text(text: &str, crlf: bool, bom: bool) -> Vec<u8> {
     bytes
 }
 
+
+fn tool_active(id: &'static str, label: &'static str, active: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .cursor_pointer()
+        .bg(if active { rgb(0x1d4ed8) } else { rgb(0x1f232e) })
+        .border_1()
+        .border_color(if active { rgb(0x3b82f6) } else { rgb(0x2d3445) })
+        .hover(move |style| style.bg(if active { rgb(0x2563eb) } else { rgb(0x2a3040) }))
+        .text_color(if active { rgb(0xffffff) } else { rgb(0xd1d5db) })
+        .font_weight(if active { FontWeight::BOLD } else { FontWeight::NORMAL })
+        .text_sm()
+        .child(label)
+}
+
 fn tool(id: &'static str, label: &'static str) -> Stateful<Div> {
     div()
         .id(id)
@@ -1538,8 +2066,447 @@ fn tool(id: &'static str, label: &'static str) -> Stateful<Div> {
         .child(label)
 }
 
+
+
+impl Editor {
+fn toggle_column_mode(&mut self, _: &ToggleColumnMode, window: &mut Window, cx: &mut Context<Self>) {
+        self.column_mode = !self.column_mode;
+        if self.column_mode {
+            let cursor = self.input.read(cx).cursor_position();
+            let line = cursor.line as usize;
+            let col = cursor.character as usize;
+            self.column_start_line = line;
+            self.column_end_line = line.saturating_add(1).min(self.lines.saturating_sub(1));
+            self.column_col = col;
+            self.column_width = 0;
+            self.column_reversed = false;
+            Theme::global_mut(cx).caret = rgba(0x00000000).into();
+            self.message = format!("Column Mode ON: Lines {}..{}, Col {}", self.column_start_line + 1, self.column_end_line + 1, self.column_col + 1);
+        } else {
+            Theme::global_mut(cx).caret = rgb(0xffffff).into();
+            let target_line = self.column_start_line.min(self.column_end_line);
+            let target_col = self.column_col;
+            self.input.update(cx, |state, cx| {
+                state.set_cursor_position(
+                    gpui_component::input::Position {
+                        line: target_line as u32,
+                        character: target_col as u32,
+                    },
+                    window,
+                    cx,
+                );
+                state.focus(window, cx);
+            });
+            self.message = "Column Mode OFF".into();
+        }
+        self.input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    fn sync_column_input_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let line = self.column_end_line;
+        let col = if self.column_reversed { self.column_col } else { self.column_col + self.column_width };
+        self.input.update(cx, |state, cx| {
+            state.set_cursor_position(
+                gpui_component::input::Position { line: line as u32, character: col as u32 },
+                window,
+                cx,
+            );
+        });
+    }
+
+    fn column_extend_down(&mut self, _: &ColumnExtendDown, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.column_mode {
+            self.toggle_column_mode(&ToggleColumnMode, window, cx);
+            return;
+        }
+        self.column_end_line = extended_column_head(self.column_end_line, self.lines, true);
+        self.message = format!("Column Selection: Lines {}..{}, Col {} (w:{})", self.column_start_line.min(self.column_end_line) + 1, self.column_start_line.max(self.column_end_line) + 1, self.column_col + 1, self.column_width);
+        self.sync_column_input_cursor(window, cx);
+        cx.notify();
+    }
+
+    fn column_extend_up(&mut self, _: &ColumnExtendUp, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.column_mode {
+            self.toggle_column_mode(&ToggleColumnMode, window, cx);
+            self.column_end_line = self.column_start_line;
+        }
+        self.column_end_line = extended_column_head(self.column_end_line, self.lines, false);
+        self.message = format!("Column Selection: Lines {}..{}, Col {} (w:{})", self.column_start_line.min(self.column_end_line) + 1, self.column_start_line.max(self.column_end_line) + 1, self.column_col + 1, self.column_width);
+        self.sync_column_input_cursor(window, cx);
+        cx.notify();
+    }
+
+    fn navigate_column(&mut self, navigation: ColumnNavigation, select: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let head = if self.column_reversed { self.column_col } else { self.column_col + self.column_width };
+        let text = self.input.read(cx).text().slice_lines(self.column_end_line..self.column_end_line + 1).to_string();
+        let target = column_navigation_target(&text, head, navigation);
+        self.set_column_head(target, select, window, cx);
+    }
+
+    fn set_column_head(&mut self, target: usize, select: bool, window: &mut Window, cx: &mut Context<Self>) {
+        (self.column_col, self.column_width, self.column_reversed) = column_range_after_navigation(
+            self.column_col, self.column_width, self.column_reversed, target, select);
+        self.sync_column_input_cursor(window, cx);
+        cx.notify();
+    }
+
+    fn column_extend_right(&mut self, _: &ColumnExtendRight, window: &mut Window, cx: &mut Context<Self>) {
+        if self.column_mode {
+            let head = if self.column_reversed { self.column_col } else { self.column_col + self.column_width };
+            self.set_column_head(head.saturating_add(1), true, window, cx);
+        }
+    }
+    fn column_extend_left(&mut self, _: &ColumnExtendLeft, window: &mut Window, cx: &mut Context<Self>) {
+        if self.column_mode {
+            let head = if self.column_reversed { self.column_col } else { self.column_col + self.column_width };
+            self.set_column_head(head.saturating_sub(1), true, window, cx);
+        }
+    }
+    fn column_shift_left(&mut self, _: &ColumnShiftLeft, window: &mut Window, cx: &mut Context<Self>) {
+        if self.column_mode {
+            let target = if self.column_width > 0 { self.column_col } else { self.column_col.saturating_sub(1) };
+            self.set_column_head(target, false, window, cx);
+        }
+    }
+    fn column_shift_right(&mut self, _: &ColumnShiftRight, window: &mut Window, cx: &mut Context<Self>) {
+        if self.column_mode {
+            let target = if self.column_width > 0 { self.column_col + self.column_width } else { self.column_col.saturating_add(1) };
+            self.set_column_head(target, false, window, cx);
+        }
+    }
+
+    fn column_shift_up(&mut self, _: &ColumnShiftUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.column_mode && self.column_start_line > 0 && self.column_end_line > 0 {
+            self.column_start_line -= 1;
+            self.column_end_line -= 1;
+            self.message = format!("Column Carets: Lines {}..{}, Col {} (w:{})", self.column_start_line.min(self.column_end_line) + 1, self.column_start_line.max(self.column_end_line) + 1, self.column_col + 1, self.column_width);
+            self.sync_column_input_cursor(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn column_shift_down(&mut self, _: &ColumnShiftDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.column_mode && self.column_start_line.max(self.column_end_line) + 1 < self.lines {
+            self.column_start_line += 1;
+            self.column_end_line += 1;
+            self.message = format!("Column Carets: Lines {}..{}, Col {} (w:{})", self.column_start_line.min(self.column_end_line) + 1, self.column_start_line.max(self.column_end_line) + 1, self.column_col + 1, self.column_width);
+            self.sync_column_input_cursor(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn column_escape(&mut self, _: &ColumnEscape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_context_menu.is_some() {
+            self.tab_context_menu = None;
+            cx.notify();
+        } else if self.column_mode {
+            self.column_mode = false;
+            Theme::global_mut(cx).caret = rgb(0xffffff).into();
+            let target_line = self.column_start_line.min(self.column_end_line);
+            let target_col = self.column_col;
+            self.input.update(cx, |state, cx| {
+                state.set_cursor_position(
+                    gpui_component::input::Position {
+                        line: target_line as u32,
+                        character: target_col as u32,
+                    },
+                    window,
+                    cx,
+                );
+                state.focus(window, cx);
+            });
+            self.message = "Column Mode OFF".into();
+            cx.notify();
+        }
+    }
+
+    #[allow(dead_code)]
+    fn apply_column_insert_text(&mut self, insert_str: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let original = self.text(cx);
+        let new_text = apply_column_insert(
+            &original,
+            self.column_start_line,
+            self.column_end_line,
+            self.column_col,
+            self.column_width,
+            &insert_str,
+        );
+        let target_line = self.column_start_line.min(self.column_end_line);
+        let target_col = self.column_col + insert_str.chars().count();
+        self.input.update(cx, |state, cx| {
+            state.set_value(new_text, window, cx);
+            state.set_cursor_position(
+                gpui_component::input::Position {
+                    line: target_line as u32,
+                    character: target_col as u32,
+                },
+                window,
+                cx,
+            );
+        });
+        let total_lines = self.column_start_line.abs_diff(self.column_end_line) + 1;
+        self.message = format!("Column edit applied ({} lines)", total_lines);
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    fn apply_column_insert_numbers(&mut self, start: i64, step: i64, zero_pad: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let original = self.text(cx);
+        let new_text = apply_column_numbers(
+            &original,
+            self.column_start_line,
+            self.column_end_line,
+            self.column_col,
+            self.column_width,
+            start,
+            step,
+            zero_pad,
+        );
+        let target_line = self.column_start_line.min(self.column_end_line);
+        let target_col = self.column_col + 2;
+        self.input.update(cx, |state, cx| {
+            state.set_value(new_text, window, cx);
+            state.set_cursor_position(
+                gpui_component::input::Position {
+                    line: target_line as u32,
+                    character: target_col as u32,
+                },
+                window,
+                cx,
+            );
+        });
+        let total_lines = self.column_start_line.abs_diff(self.column_end_line) + 1;
+        self.message = format!("Column numbers inserted ({} lines)", total_lines);
+        cx.notify();
+    }
+
+    fn apply_column_delete_box(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let original = self.text(cx);
+        let new_text = apply_column_delete(
+            &original,
+            self.column_start_line,
+            self.column_end_line,
+            self.column_col,
+            self.column_width,
+        );
+        let target_line = self.column_start_line.min(self.column_end_line);
+        let target_col = self.column_col;
+        self.input.update(cx, |state, cx| {
+            state.set_value(new_text, window, cx);
+            state.set_cursor_position(
+                gpui_component::input::Position {
+                    line: target_line as u32,
+                    character: target_col as u32,
+                },
+                window,
+                cx,
+            );
+        });
+        self.column_width = 0;
+        self.column_reversed = false;
+        let total_lines = self.column_start_line.abs_diff(self.column_end_line) + 1;
+        self.message = format!("Column deleted ({} lines)", total_lines);
+        cx.notify();
+    }
+
+
+    fn apply_column_char_insert(&mut self, insert_str: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let original = self.text(cx);
+        let new_text = apply_column_insert(
+            &original,
+            self.column_start_line,
+            self.column_end_line,
+            self.column_col,
+            self.column_width,
+            insert_str,
+        );
+        self.column_col += insert_str.chars().count();
+        self.column_width = 0;
+            self.column_reversed = false;
+        let target_line = self.column_start_line.min(self.column_end_line);
+        let target_col = self.column_col;
+        self.input.update(cx, |state, cx| {
+            state.set_value(new_text, window, cx);
+            state.set_cursor_position(
+                gpui_component::input::Position {
+                    line: target_line as u32,
+                    character: target_col as u32,
+                },
+                window,
+                cx,
+            );
+        });
+        cx.notify();
+    }
+
+
+    fn apply_column_outdent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.column_mode { return; }
+        let original = self.text(cx);
+        let (new_text, removed) = apply_column_outdent(
+            &original, self.column_start_line, self.column_end_line, self.column_col, 4,
+        );
+        if removed == 0 { return; }
+        self.column_col = self.column_col.saturating_sub(removed);
+        let target_line = self.column_start_line.min(self.column_end_line);
+        self.input.update(cx, |state, cx| {
+            state.set_value(new_text, window, cx);
+            state.set_cursor_position(Position { line: target_line as u32, character: self.column_col as u32 }, window, cx);
+        });
+        self.message = format!("Column outdent applied ({} lines)", self.column_start_line.abs_diff(self.column_end_line) + 1);
+        cx.notify();
+    }
+
+    fn apply_column_backspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.column_width > 0 {
+            self.apply_column_delete_box(window, cx);
+            return;
+        }
+        if self.column_col == 0 {
+            return;
+        }
+        let original = self.text(cx);
+        let new_text = apply_column_delete(
+            &original,
+            self.column_start_line,
+            self.column_end_line,
+            self.column_col - 1,
+            1,
+        );
+        self.column_col -= 1;
+        let target_line = self.column_start_line.min(self.column_end_line);
+        let target_col = self.column_col;
+        self.input.update(cx, |state, cx| {
+            state.set_value(new_text, window, cx);
+            state.set_cursor_position(
+                gpui_component::input::Position {
+                    line: target_line as u32,
+                    character: target_col as u32,
+                },
+                window,
+                cx,
+            );
+        });
+        cx.notify();
+    }
+
+    fn handle_editor_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.column_mode {
+            return false;
+        }
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+
+        let navigation = match key {
+            "home" => Some(ColumnNavigation::Home),
+            "end" => Some(ColumnNavigation::End),
+            "left" if mods.control => Some(ColumnNavigation::PreviousWord),
+            "right" if mods.control => Some(ColumnNavigation::NextWord),
+            _ => None,
+        };
+        if let Some(navigation) = navigation {
+            self.navigate_column(navigation, mods.shift, window, cx);
+            return true;
+        }
+        if key == "escape" {
+            self.column_escape(&ColumnEscape, window, cx);
+            return true;
+        }
+
+        if key == "backspace" && !mods.control && !mods.alt {
+            self.apply_column_backspace(window, cx);
+            return true;
+        }
+
+        if key == "delete" && !mods.control && !mods.alt {
+            self.apply_column_delete_box(window, cx);
+            return true;
+        }
+
+        if key == "left" {
+            if mods.shift {
+                self.column_extend_left(&ColumnExtendLeft, window, cx);
+            } else {
+                self.column_shift_left(&ColumnShiftLeft, window, cx);
+            }
+            return true;
+        }
+
+        if key == "right" {
+            if mods.shift {
+                self.column_extend_right(&ColumnExtendRight, window, cx);
+            } else {
+                self.column_shift_right(&ColumnShiftRight, window, cx);
+            }
+            return true;
+        }
+
+        if key == "up" {
+            if mods.shift {
+                self.column_extend_up(&ColumnExtendUp, window, cx);
+            } else {
+                self.column_shift_up(&ColumnShiftUp, window, cx);
+            }
+            return true;
+        }
+
+        if key == "down" {
+            if mods.shift {
+                self.column_extend_down(&ColumnExtendDown, window, cx);
+            } else {
+                self.column_shift_down(&ColumnShiftDown, window, cx);
+            }
+            return true;
+        }
+
+        // Printable char insertion
+        if !mods.control && !mods.alt && !mods.platform && !mods.function {
+            let insert_char: Option<&str> = match key {
+                "space" => Some(" "),
+                "tab" => Some("    "),
+                s if s.chars().count() == 1 => Some(s),
+                _ => None,
+            };
+            if let Some(ch) = insert_char {
+                self.apply_column_char_insert(ch, window, cx);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn column_cursors_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let input = self.input.clone();
+        let first = self.column_start_line.min(self.column_end_line);
+        let last = self.column_start_line.max(self.column_end_line);
+        let column = self.column_col;
+        let width = self.column_width;
+        let reversed = self.column_reversed;
+        div().absolute().inset_0().child(canvas(
+            move |_, _, _| {},
+            move |_, _, window, cx| {
+                let carets = input.read(cx).column_caret_bounds(first, last, column, width);
+                let left_carets = if reversed { input.read(cx).column_caret_bounds(first, last, column, 0) } else { Vec::new() };
+                for (index, (_, caret, selection)) in carets.into_iter().enumerate() {
+                    let caret = left_carets.get(index).map(|(_, bounds, _)| *bounds).unwrap_or(caret);
+                    if width > 0 { window.paint_quad(fill(selection, rgba(0x38bdf826))); }
+                    window.paint_quad(fill(caret, rgb(0x38bdf8)));
+                }
+            },
+        ).size_full())
+    }
+
+}
+
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.column_mode {
+            Theme::global_mut(cx).caret = rgba(0x00000000).into();
+        } else {
+            Theme::global_mut(cx).caret = rgb(0xffffff).into();
+        }
         let dirty = self.dirty_cached;
         let name = self.document_name(self.active_tab);
         let title = format!(
@@ -1553,6 +2520,7 @@ impl Render for Editor {
         }
         let lines = self.lines;
         let chars = self.chars;
+        let cursor_pos = self.input.read(cx).cursor_position();
         div()
             .size_full()
             .relative()
@@ -1561,6 +2529,7 @@ impl Render for Editor {
             .bg(rgb(0x13151b))
             .text_color(rgb(0xe2e8f0))
             .font_family("Segoe UI")
+            //
             .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::save_file))
@@ -1572,6 +2541,18 @@ impl Render for Editor {
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
+            .on_action(cx.listener(Self::toggle_column_mode))
+            .on_action(cx.listener(Self::column_extend_down))
+            .on_action(cx.listener(Self::column_extend_up))
+            .on_action(cx.listener(Self::column_extend_right))
+            .on_action(cx.listener(Self::column_extend_left))
+            .on_action(cx.listener(Self::column_shift_left))
+            .on_action(cx.listener(Self::column_shift_right))
+            .on_action(cx.listener(Self::column_shift_up))
+            .on_action(cx.listener(Self::column_shift_down))
+            .on_action(cx.listener(Self::column_escape))
+            .on_action(cx.listener(|this, _: &GoToLine, w, cx| this.open_goto_line(w, cx)))
+            .on_action(cx.listener(|this, _: &GoToLineEscape, w, cx| this.close_goto_line(w, cx)))
             .child(
                 div()
                     .flex()
@@ -1594,6 +2575,10 @@ impl Render for Editor {
                     .child(tool("toggle-minimap", if self.minimap_visible { "Minimap ON" } else { "Minimap OFF" }).on_click(
                         cx.listener(|this, _, w, cx| this.toggle_minimap(&ToggleMinimap, w, cx)),
                     ))
+                    .child(
+                        tool_active("toggle-column", if self.column_mode { "Column: ON (Alt+C)" } else { "Column (Alt+C)" }, self.column_mode)
+                            .on_click(cx.listener(|this, _, w, cx| this.toggle_column_mode(&ToggleColumnMode, w, cx))),
+                    )
                     .child(
                         tool("new", "New   Ctrl+N")
                             .on_click(cx.listener(|this, _, w, cx| this.new_file(&NewFile, w, cx))),
@@ -1627,19 +2612,157 @@ impl Render for Editor {
                             .min_w_0()
                             .h_full()
                             .child(self.tab_bar(cx))
+
                             .child(
                                 div()
                                     .flex()
                                     .flex_1()
                                     .min_h_0()
                                     .child(
-                                        div().flex_1().min_w_0().min_h_0().overflow_hidden().px_3().pb_2().child(
-                                            Input::new(&self.input)
-                                                .h_full()
-                                                .appearance(false)
-                                                .font_family("Cascadia Code")
-                                                .text_size(px(16.)),
-                                        ),
+                                        div().relative().flex_1().min_w_0().min_h_0().overflow_hidden().px_3().pb_2()
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveHome, window, cx| {
+                                                if this.column_mode {
+                                                    this.navigate_column(ColumnNavigation::Home, false, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveEnd, window, cx| {
+                                                if this.column_mode {
+                                                    this.navigate_column(ColumnNavigation::End, false, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::SelectToStartOfLine, window, cx| {
+                                                if this.column_mode {
+                                                    this.navigate_column(ColumnNavigation::Home, true, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::SelectToEndOfLine, window, cx| {
+                                                if this.column_mode {
+                                                    this.navigate_column(ColumnNavigation::End, true, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveToPreviousWord, window, cx| {
+                                                if this.column_mode {
+                                                    this.navigate_column(ColumnNavigation::PreviousWord, false, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveToNextWord, window, cx| {
+                                                if this.column_mode {
+                                                    this.navigate_column(ColumnNavigation::NextWord, false, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::SelectToPreviousWordStart, window, cx| {
+                                                if this.column_mode {
+                                                    this.navigate_column(ColumnNavigation::PreviousWord, true, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::SelectToNextWordEnd, window, cx| {
+                                                if this.column_mode {
+                                                    this.navigate_column(ColumnNavigation::NextWord, true, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::Paste, window, cx| {
+                                                if this.column_mode {
+                                                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                                                        if !text.contains(['\r', '\n']) {
+                                                            this.apply_column_char_insert(&text, window, cx);
+                                                            cx.stop_propagation();
+                                                        }
+                                                    }
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::SelectUp, window, cx| {
+                                                if this.column_mode {
+                                                    this.column_extend_up(&ColumnExtendUp, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::SelectDown, window, cx| {
+                                                if this.column_mode {
+                                                    this.column_extend_down(&ColumnExtendDown, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::SelectLeft, window, cx| {
+                                                if this.column_mode {
+                                                    this.column_extend_left(&ColumnExtendLeft, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::SelectRight, window, cx| {
+                                                if this.column_mode {
+                                                    this.column_extend_right(&ColumnExtendRight, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveLeft, window, cx| {
+                                                if this.column_mode {
+                                                    this.column_shift_left(&ColumnShiftLeft, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveRight, window, cx| {
+                                                if this.column_mode {
+                                                    this.column_shift_right(&ColumnShiftRight, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveUp, window, cx| {
+                                                if this.column_mode {
+                                                    this.column_shift_up(&ColumnShiftUp, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveDown, window, cx| {
+                                                if this.column_mode {
+                                                    this.column_shift_down(&ColumnShiftDown, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                                                if this.column_mode {
+                                                    this.apply_column_char_insert("    ", window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &OutdentInline, window, cx| {
+                                                if this.column_mode {
+                                                    this.apply_column_outdent(window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &Backspace, window, cx| {
+                                                if this.column_mode {
+                                                    this.apply_column_backspace(window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &Delete, window, cx| {
+                                                if this.column_mode {
+                                                    this.apply_column_delete_box(window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                                if this.handle_editor_key_down(event, window, cx) {
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .child(
+                                                Input::new(&self.input)
+                                                    .h_full()
+                                                    .appearance(false)
+                                                    .font_family("Cascadia Code")
+                                                    .text_size(px(16.)),
+                                            )
+                                            .children(self.column_mode.then(|| self.column_cursors_overlay(cx))),
                                     )
                                     .children(self.minimap_visible.then(|| self.minimap_panel(cx))),
                             ),
@@ -1650,21 +2773,93 @@ impl Render for Editor {
                     .flex()
                     .justify_between()
                     .items_center()
-                    .px_4()
-                    .py_2()
+                    .px_3()
+                    .py_1p5()
                     .text_xs()
-                    .bg(rgb(0x101217)).border_t_1().border_color(rgb(0x1e222d))
-                    .child(format!(
-                        "{}   ·   {} lines   {} chars",
-                        self.message, lines, chars
-                    ))
-                    .child(format!(
-                        "{}   |   UTF-8{}   |   {}   |   Ctrl+F Find / Replace",
-                        detect_language(self.path.as_deref()).1,
-                        if self.bom { " BOM" } else { "" },
-                        if self.crlf { "CRLF" } else { "LF" }
-                    )),
+                    .bg(rgb(0x101217))
+                    .border_t_1()
+                    .border_color(rgb(0x1e222d))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_color(rgb(0x94a3b8))
+                                    .child(self.message.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id("status-cursor-pos")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .bg(rgb(0x1c212c))
+                                    .text_color(rgb(0x60a5fa))
+                                    .hover(|s| s.bg(rgb(0x2a3244)).text_color(rgb(0x93c5fd)))
+                                    .child(format!("Ln {}, Col {}", cursor_pos.line + 1, cursor_pos.character + 1))
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.open_goto_line(w, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(0x64748b))
+                                    .child(format!("{} lines · {} chars", lines, chars)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .text_color(rgb(0xa5b4fc))
+                                    .child(detect_language(self.path.as_deref()).1),
+                            )
+                            .child(
+                                div()
+                                    .id("status-encoding-btn")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .bg(rgb(0x1a2130))
+                                    .text_color(rgb(if self.bom { 0xf59e0b } else { 0xe2e8f0 }))
+                                    .hover(|s| s.bg(rgb(0x28334a)))
+                                    .child(if self.bom { "UTF-8 BOM" } else { "UTF-8" })
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.toggle_bom_active(w, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("status-crlf-btn")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .bg(rgb(0x1a2130))
+                                    .text_color(rgb(0xe2e8f0))
+                                    .hover(|s| s.bg(rgb(0x28334a)))
+                                    .child(if self.crlf { "CRLF" } else { "LF" })
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.toggle_crlf_active(w, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(0x475569))
+                                    .child("Ctrl+G Jump | Ctrl+F Find"),
+                            ),
+                    ),
             )
+            .children(self.goto_line_open.then(|| self.goto_line_panel(window, cx)))
             .child(self.tab_context_menu_panel(window, cx))
     }
 }
@@ -1709,6 +2904,15 @@ fn main() {
             KeyBinding::new("ctrl-w", CloseTab, None),
             KeyBinding::new("ctrl-tab", NextTab, None),
             KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
+            KeyBinding::new("alt-c", ToggleColumnMode, None),
+            KeyBinding::new("ctrl-alt-down", ColumnExtendDown, None),
+            KeyBinding::new("ctrl-alt-up", ColumnExtendUp, None),
+            KeyBinding::new("alt-shift-down", ColumnExtendDown, None),
+            KeyBinding::new("alt-shift-up", ColumnExtendUp, None),
+            KeyBinding::new("alt-shift-right", ColumnExtendRight, None),
+            KeyBinding::new("alt-shift-left", ColumnExtendLeft, None),
+            KeyBinding::new("escape", ColumnEscape, None),
+            KeyBinding::new("ctrl-g", GoToLine, None),
         ]);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -1771,469 +2975,4 @@ fn main() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{calculate_minimap_scroll, calculate_minimap_viewport, calculate_tree_scroll_offset, decode_text, detect_language, encode_text, minimap_click_to_line, minimap_coord_to_line, minimap_segments, MINIMAP_LINE_HEIGHT};
-    #[test]
-    fn minimap_merges_runs_and_bounds_scene_size() {
-        let merged = minimap_segments("    abcdefghijklmnopqrstuvwxyz");
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].0, 5.0);
-        assert!(merged[0].1 > 30.0);
-        assert!(minimap_segments(" \t ").is_empty());
-        let adversarial = "a1{} ".repeat(40);
-        let spans = minimap_segments(&adversarial);
-        assert!(spans.len() <= 16);
-        assert!(spans.iter().all(|(x, w, _)| *x >= 0.0 && *w > 0.0 && x + w <= 125.0));
-        assert!(!minimap_segments("    中文🙂").is_empty());
-    }
-
-    #[test]
-    fn startup_accepts_multiple_files() {
-        let paths = super::startup_paths(["editor.exe".into(), "一.md".into(), "two.rs".into()]);
-        assert_eq!(paths.len(), 2);
-        assert!(paths[0].ends_with("一.md"));
-        assert!(paths[1].ends_with("two.rs"));
-    }
-
-    #[test]
-    fn tab_title_truncation_and_layout_bounds() {
-        let long_name = "this_is_an_extremely_long_source_file_name_for_testing_tab_bar_overflow.rs";
-        let dirty = true;
-        let formatted = format!("{}{}", if dirty { "● " } else { "" }, long_name);
-        assert!(formatted.starts_with("● "));
-        assert!(formatted.contains(long_name));
-        // Ensure index wraps gracefully even when tab count is large
-        let large_tab_count = 50;
-        assert_eq!(super::next_tab_index(49, large_tab_count, true), 0);
-        assert_eq!(super::next_tab_index(0, large_tab_count, false), 49);
-    }
-
-    #[test]
-    fn tab_cycle_wraps_in_both_directions() {
-        assert_eq!(super::next_tab_index(2, 3, true), 0);
-        assert_eq!(super::next_tab_index(0, 3, false), 2);
-        assert_eq!(super::next_tab_index(0, 1, false), 0);
-        assert_eq!(super::next_tab_index(0, 1, true), 0);
-    }
-
-    #[test]
-    fn startup_without_file_keeps_blank_document() {
-        assert_eq!(super::startup_path(["editor.exe".into()]), None);
-    }
-
-    #[test]
-    fn startup_preserves_chinese_and_spaces() {
-        let path = std::path::PathBuf::from(r"C:\中文目录\我的 文档.md");
-        let actual = super::startup_path(["editor.exe".into(), path.clone().into_os_string()]);
-        assert_eq!(actual, Some(path));
-    }
-
-    #[test]
-    fn startup_resolves_relative_markdown_path() {
-        let path = super::startup_path(["editor.exe".into(), "文档 示例.md".into()]).unwrap();
-        assert_eq!(path, std::env::current_dir().unwrap().join("文档 示例.md"));
-        assert_eq!(detect_language(Some(&path)).0, "markdown");
-    }
-
-    #[test]
-    fn detects_common_languages_and_special_filenames() {
-        for (file, expected) in [
-            ("main.RS", "rust"),
-            ("hello.py", "python"),
-            ("app.jsx", "javascript"),
-            ("app.ts", "typescript"),
-            ("app.tsx", "tsx"),
-            ("main.c", "c"),
-            ("main.hpp", "cpp"),
-            ("Program.cs", "csharp"),
-            ("Main.java", "java"),
-            ("main.go", "go"),
-            ("index.html", "html"),
-            ("style.css", "css"),
-            ("a.json", "json"),
-            ("Cargo.toml", "toml"),
-            ("a.yml", "yaml"),
-            ("README.md", "markdown"),
-            ("a.sql", "sql"),
-            ("run.sh", "bash"),
-            ("Makefile", "make"),
-            ("CMakeLists.txt", "cmake"),
-            (".bashrc", "bash"),
-            ("a.txt", "text"),
-            ("a.unknown", "text"),
-        ] {
-            assert_eq!(
-                detect_language(Some(std::path::Path::new(file))).0,
-                expected,
-                "{file}"
-            );
-        }
-        assert_eq!(detect_language(None).0, "text");
-    }
-
-    #[test]
-    fn utf8_bom_and_windows_line_endings_round_trip() {
-        let input = b"\xef\xbb\xbfhello\r\nworld\r\n";
-        let (text, crlf, bom) = decode_text(input).unwrap();
-        assert_eq!(text, "hello\nworld\n");
-        assert_eq!(encode_text(&text, crlf, bom), input);
-    }
-    #[test]
-    fn chinese_text_and_lf_round_trip() {
-        let input = "中文输入\n第二行🦀";
-        let (text, crlf, bom) = decode_text(input.as_bytes()).unwrap();
-        assert_eq!(encode_text(&text, crlf, bom), input.as_bytes());
-    }
-    #[test]
-    fn native_dialog_runs_on_a_separate_thread() {
-        let caller = std::thread::current().id();
-        let worker = super::native_dialog(|| std::thread::current().id()).unwrap();
-        assert_ne!(caller, worker);
-    }
-
-    #[test]
-    fn ancestor_dirs_under_root_returns_correct_hierarchy() {
-        let root = std::path::Path::new(r"C:\project");
-        let child = std::path::Path::new(r"C:\project\src\nested\mod.rs");
-        let ancestors = super::ancestor_dirs_under_root(child, root);
-        assert_eq!(ancestors.len(), 2);
-        assert!(ancestors[0].ends_with("src"));
-        assert!(ancestors[1].ends_with("nested"));
-    }
-
-    #[test]
-    fn ancestor_dirs_outside_root_returns_empty() {
-        let root = std::path::Path::new(r"C:\project");
-        let child = std::path::Path::new(r"D:\other\file.txt");
-        let ancestors = super::ancestor_dirs_under_root(child, root);
-        assert!(ancestors.is_empty());
-    }
-
-    #[test]
-    fn same_path_ignores_unc_prefix() {
-        let p1 = std::env::current_dir().unwrap();
-        let p2 = std::fs::canonicalize(&p1).unwrap();
-        assert!(super::same_path(&p1, &p2));
-    }
-
-    #[test]
-    fn tree_ancestors_expansion_populates_intermediate_caches() {
-        let temp_dir = std::env::var_os("FEIBO_TMP")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join(format!("editor-tree-test-{}", std::process::id()));
-        let sub = temp_dir.join("level1").join("level2");
-        std::fs::create_dir_all(&sub).unwrap();
-        let file = sub.join("doc.txt");
-        std::fs::write(&file, "test").unwrap();
-
-        let ancestors = super::ancestor_dirs_under_root(&file, &temp_dir);
-        assert_eq!(ancestors.len(), 2);
-        let mut expanded = std::collections::HashSet::new();
-        let mut tree_cache = std::collections::HashMap::new();
-
-        for dir in &ancestors {
-            expanded.insert(dir.clone());
-            if !tree_cache.contains_key(dir) {
-                if let Ok(entries) = super::read_directory(dir) {
-                    tree_cache.insert(dir.clone(), entries);
-                }
-            }
-        }
-
-        assert!(expanded.iter().any(|p| super::same_path(p, &temp_dir.join("level1"))));
-        assert!(expanded.iter().any(|p| super::same_path(p, &temp_dir.join("level1").join("level2"))));
-        assert!(tree_cache.contains_key(&ancestors[0]));
-        assert!(tree_cache.contains_key(&ancestors[1]));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn file_round_trip_with_chinese_path() {
-        let root = std::env::var_os("FEIBO_TMP")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let folder = root.join(format!("editor-io-test-{}", std::process::id()));
-        std::fs::create_dir_all(&folder).unwrap();
-        let path = folder.join("中文 文档.txt");
-        let text = "保存测试🦀\n第二行\n";
-        for (crlf, bom) in [(true, true), (true, false), (false, false)] {
-            let bytes = encode_text(text, crlf, bom);
-            std::fs::write(&path, &bytes).unwrap();
-            let read = std::fs::read(&path).unwrap();
-            let (decoded, actual_crlf, actual_bom) = decode_text(&read).unwrap();
-            assert_eq!(decoded, text);
-            assert_eq!((actual_crlf, actual_bom), (crlf, bom));
-            assert_eq!(encode_text(&decoded, actual_crlf, actual_bom), bytes);
-        }
-    }
-
-    #[test]
-    fn parses_all_supported_languages_with_tree_sitter() {
-        for lang in [
-            "rust",
-            "python",
-            "javascript",
-            "typescript",
-            "tsx",
-            "c",
-            "cpp",
-            "csharp",
-            "java",
-            "go",
-            "ruby",
-            "swift",
-            "scala",
-            "zig",
-            "elixir",
-            "bash",
-            "html",
-            "css",
-            "json",
-            "toml",
-            "yaml",
-            "markdown",
-            "sql",
-            "graphql",
-            "proto",
-            "cmake",
-            "make",
-            "diff",
-            "ejs",
-            "erb",
-            "text",
-        ] {
-            if lang == "text" {
-                continue;
-            }
-            let language = gpui_component::highlighter::Language::from_str(lang);
-            assert_ne!(language.name(), "text", "语言 {lang} 应该被识别为有效语法");
-            let parser = gpui_component::highlighter::LanguageRegistry::singleton().language(lang);
-            assert!(
-                parser.is_some(),
-                "语言 {lang} 应该能够成功载入 Tree-sitter 语法解析器"
-            );
-        }
-    }
-
-        #[test]
-    fn minimap_segments_and_click_mapping_behave_properly() {
-        let segs = minimap_segments("    let x = 42; // note");
-        assert!(!segs.is_empty(), "minimap strokes should not be empty");
-        let first = segs[0];
-        assert!(first.0 >= 4.0 * 1.25, "indentation should be preserved in coordinates");
-
-        let line = minimap_click_to_line(50.0, 100.0, 100);
-        assert_eq!(line, 50, "middle click maps to middle line");
-
-        let (start, end) = calculate_minimap_viewport(10, 100, 20);
-        assert!(start <= 10 && end >= 10, "viewport window includes cursor");
-    }
-
-    #[test]
-    fn tree_scroll_offset_centers_out_of_view_row_and_keeps_in_view_stable() {
-        const ROW_HEIGHT: f32 = 28.0;
-        const VIEWPORT_H: f32 = 600.0;
-        const TOTAL_ROWS: usize = 60;
-
-        // 位于视口中央偏上的第 5 行，当前已在可视区内且上下均有余量，无需重置滚动条
-        assert_eq!(
-            calculate_tree_scroll_offset(5, TOTAL_ROWS, ROW_HEIGHT, VIEWPORT_H, 0.0),
-            None
-        );
-
-        // 位于深处的第 45 行，超出视口下方，应返回居中偏移量
-        let offset = calculate_tree_scroll_offset(45, TOTAL_ROWS, ROW_HEIGHT, VIEWPORT_H, 0.0);
-        assert!(offset.is_some());
-        let offset_y = offset.unwrap();
-        assert!(offset_y < 0.0);
-        // 目标行中心在经过偏移后应恰好对齐视口中央
-        let row_center_in_viewport = (45.0 * ROW_HEIGHT + ROW_HEIGHT / 2.0) + offset_y;
-        assert!((row_center_in_viewport - VIEWPORT_H / 2.0).abs() < 1.0);
-
-        // 位于第 0 行时从下方跳回，理想居中偏上，但经过上边界 clamp 限制为 0.0（顶格不留白）
-        assert_eq!(
-            calculate_tree_scroll_offset(0, TOTAL_ROWS, ROW_HEIGHT, VIEWPORT_H, -800.0),
-            Some(0.0)
-        );
-
-        // 位于最后一行时，应受限于最大滚动范围（底格不留白）
-        let max_scroll = (TOTAL_ROWS as f32 * ROW_HEIGHT) - VIEWPORT_H;
-        assert_eq!(
-            calculate_tree_scroll_offset(59, TOTAL_ROWS, ROW_HEIGHT, VIEWPORT_H, 0.0),
-            Some(-max_scroll)
-        );
-    }
-
-
-    #[test]
-    fn flattened_tree_cache_and_virtualization() {
-        let temp_dir = std::env::var_os("FEIBO_TMP")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join(format!("flattened-tree-test-{}", std::process::id()));
-        let dir_a = temp_dir.join("folder_a");
-        let dir_b = temp_dir.join("folder_b");
-        let sub_dir = dir_a.join("sub_folder");
-        std::fs::create_dir_all(&sub_dir).unwrap();
-        std::fs::create_dir_all(&dir_b).unwrap();
-        std::fs::write(dir_a.join("file_1.txt"), "1").unwrap();
-        std::fs::write(sub_dir.join("sub_file.txt"), "sub").unwrap();
-        std::fs::write(dir_b.join("file_2.txt"), "2").unwrap();
-
-        let norm_root = super::normalized_path(&temp_dir);
-        let entries = super::read_directory(&norm_root).unwrap();
-        let mut tree_cache = std::collections::HashMap::new();
-        tree_cache.insert(norm_root.clone(), entries);
-
-        let mut expanded = std::collections::HashSet::new();
-        // 初始折叠
-        let norm_dir_a = super::normalized_path(&dir_a);
-        let _norm_dir_b = super::normalized_path(&dir_b);
-        let _norm_sub_dir = super::normalized_path(&sub_dir);
-
-        // 模拟 collect
-        let collect = |cache: &std::collections::HashMap<std::path::PathBuf, Vec<super::TreeEntry>>,
-                       exp: &std::collections::HashSet<std::path::PathBuf>,
-                       root: &std::path::Path| {
-            let mut result = Vec::new();
-            fn rec(
-                path: &std::path::Path,
-                depth: usize,
-                cache: &std::collections::HashMap<std::path::PathBuf, Vec<super::TreeEntry>>,
-                exp: &std::collections::HashSet<std::path::PathBuf>,
-                out: &mut Vec<super::FlattenedTreeEntry>,
-            ) {
-                if let Some(entries) = cache.get(path) {
-                    for e in entries {
-                        let is_exp = e.directory && exp.contains(&e.path);
-                        out.push(super::FlattenedTreeEntry {
-                            path: e.path.clone(),
-                            name: e.name.clone(),
-                            directory: e.directory,
-                            depth,
-                            expanded: is_exp,
-                        });
-                        if is_exp {
-                            rec(&e.path, depth + 1, cache, exp, out);
-                        }
-                    }
-                }
-            }
-            rec(root, 0, cache, exp, &mut result);
-            result
-        };
-
-        let initial_rows = collect(&tree_cache, &expanded, &norm_root);
-        assert_eq!(initial_rows.len(), 2); // 两个文件夹 folder_a 和 folder_b
-
-        // 展开 folder_a
-        expanded.insert(norm_dir_a.clone());
-        tree_cache.insert(norm_dir_a.clone(), super::read_directory(&norm_dir_a).unwrap());
-        let expanded_rows = collect(&tree_cache, &expanded, &norm_root);
-        assert_eq!(expanded_rows.len(), 4); // folder_a, file_1.txt, sub_folder, folder_b
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-
-    #[test]
-    fn minimap_scroll_calculation_handles_short_and_long_documents() {
-        const VIEWPORT_H: f32 = 600.0;
-
-        // 1. 短文档 (50 行，内容高度 50 * 2.4 = 120px < 600px)
-        let short_info = calculate_minimap_scroll(10, 50, VIEWPORT_H, MINIMAP_LINE_HEIGHT);
-        assert_eq!(short_info.scroll_y, 0.0, "短文档 Minimap 无需滚动");
-        assert_eq!(short_info.visible_range, 0..50, "短文档全部行可见");
-        assert!(short_info.slider_y >= 0.0);
-        assert!(short_info.slider_y + short_info.slider_height <= VIEWPORT_H);
-
-        // 2. 超长文档 (2000 行，内容高度 2000 * 2.4 = 4800px > 600px)
-        // 顶部光标
-        let top_info = calculate_minimap_scroll(0, 2000, VIEWPORT_H, MINIMAP_LINE_HEIGHT);
-        assert_eq!(top_info.scroll_y, 0.0, "顶部光标时 Minimap 处于最顶端");
-        assert_eq!(top_info.visible_range.start, 0);
-        assert!(top_info.visible_range.end <= 260);
-
-        // 底部光标
-        let bottom_info = calculate_minimap_scroll(1999, 2000, VIEWPORT_H, MINIMAP_LINE_HEIGHT);
-        let max_scroll = 4800.0 - VIEWPORT_H; // 4200.0
-        assert_eq!(bottom_info.scroll_y, max_scroll, "底部光标时 Minimap 滚至最底端");
-        assert_eq!(bottom_info.visible_range.end, 2000);
-        assert_eq!(bottom_info.slider_y + bottom_info.slider_height, VIEWPORT_H);
-
-        // 中间光标 (第 1000 行)
-        let mid_info = calculate_minimap_scroll(1000, 2000, VIEWPORT_H, MINIMAP_LINE_HEIGHT);
-        assert!((mid_info.scroll_y - max_scroll * 0.5).abs() < 5.0, "中间光标时平滑居中");
-        assert!(mid_info.visible_range.contains(&1000));
-    }
-
-    #[test]
-    fn minimap_coord_to_line_and_drag_bounds_clamping() {
-        const TOTAL_LINES: usize = 1000;
-        let line_height = MINIMAP_LINE_HEIGHT; // 2.4
-
-        // 无滚动时直接点击
-        assert_eq!(minimap_coord_to_line(0.0, 0.0, line_height, TOTAL_LINES), 0);
-        assert_eq!(minimap_coord_to_line(24.0, 0.0, line_height, TOTAL_LINES), 10);
-
-        // 包含滚动偏移时点击
-        let scroll_y = 1200.0; // 相当于滚动了 500 行
-        let line = minimap_coord_to_line(24.0, scroll_y, line_height, TOTAL_LINES);
-        assert_eq!(line, 510);
-
-        // 上下越界安全保护
-        assert_eq!(minimap_coord_to_line(-100.0, 0.0, line_height, TOTAL_LINES), 0);
-        assert_eq!(minimap_coord_to_line(10000.0, scroll_y, line_height, TOTAL_LINES), 999);
-    }
-
-        #[test]
-    fn batch_close_tabs_indices_calculation() {
-        use super::{calculate_tabs_to_close_indices, CloseTabsKind};
-
-        // Total 5 tabs: [0, 1, 2, 3, 4], target is 2
-        let total = 5;
-        let target = 2;
-
-        // 1. Close All: 逆序关闭所有索引 [4, 3, 2, 1, 0]
-        let all_indices = calculate_tabs_to_close_indices(CloseTabsKind::All, target, total);
-        assert_eq!(all_indices, vec![4, 3, 2, 1, 0]);
-
-        // 2. Close Others: 保留 2，先关右侧 [4, 3]，再关左侧 [1, 0]
-        let others_indices = calculate_tabs_to_close_indices(CloseTabsKind::Others, target, total);
-        assert_eq!(others_indices, vec![4, 3, 1, 0]);
-
-        // 3. Close Tabs to the Right: 仅关闭右侧 [4, 3]
-        let right_indices = calculate_tabs_to_close_indices(CloseTabsKind::Right, target, total);
-        assert_eq!(right_indices, vec![4, 3]);
-
-        // 4. Close Tabs to the Left: 仅关闭左侧 [1, 0]
-        let left_indices = calculate_tabs_to_close_indices(CloseTabsKind::Left, target, total);
-        assert_eq!(left_indices, vec![1, 0]);
-
-        // 边界测试：处于最左侧 target = 0
-        let left_at_zero = calculate_tabs_to_close_indices(CloseTabsKind::Left, 0, total);
-        assert!(left_at_zero.is_empty(), "No tabs to the left of index 0");
-        let right_at_zero = calculate_tabs_to_close_indices(CloseTabsKind::Right, 0, total);
-        assert_eq!(right_at_zero, vec![4, 3, 2, 1]);
-
-        // 边界测试：处于最右侧 target = 4
-        let right_at_end = calculate_tabs_to_close_indices(CloseTabsKind::Right, 4, total);
-        assert!(right_at_end.is_empty(), "No tabs to the right of index 4");
-        let left_at_end = calculate_tabs_to_close_indices(CloseTabsKind::Left, 4, total);
-        assert_eq!(left_at_end, vec![3, 2, 1, 0]);
-
-        // 边界测试：只有一个 tab 时
-        let single_total = 1;
-        assert!(calculate_tabs_to_close_indices(CloseTabsKind::Others, 0, single_total).is_empty());
-        assert!(calculate_tabs_to_close_indices(CloseTabsKind::Right, 0, single_total).is_empty());
-        assert!(calculate_tabs_to_close_indices(CloseTabsKind::Left, 0, single_total).is_empty());
-        assert_eq!(calculate_tabs_to_close_indices(CloseTabsKind::All, 0, single_total), vec![0]);
-    }
-
-    #[test]
-    fn rejects_binary_and_invalid_utf8() {
-        assert!(decode_text(&[0xff, 0xfe]).is_err());
-        assert!(decode_text(b"abc\0def").is_err());
-    }
-}
+mod tests;

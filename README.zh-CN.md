@@ -53,6 +53,10 @@
 | `Ctrl + B` | 显示或隐藏资源管理器 |
 | `Ctrl + M` | 显示或隐藏 Minimap |
 | `Ctrl + F` | 打开查找和替换面板 |
+| `Alt + C` | 切换列编辑（从当前行和下一行开始） |
+| `Shift + Up / Down` | 在列模式中连续扩展行范围 |
+| `Alt + Shift + Up / Down` 或 `Ctrl + Alt + Up / Down` | 添加或扩展列光标 |
+| `Shift + Left / Right` | 在列模式中调整矩形选区宽度 |
 
 ---
 

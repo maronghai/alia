@@ -1,7 +1,7 @@
 # Rust & GPUI 桌面客户端实战经验与技能总结
 
-> **项目沉淀**：基于 alia (Windows 平台) 的 Rust + GPUI 生产级开发实践  
-> **核心技术栈**：Rust (2024 Edition) + GPUI 0.2 + gpui-component 0.5 + Tree-sitter + rfd 0.15  
+> **项目沉淀**：基于 alia (Windows 平台) 的 Rust + GPUI 生产级开发实践
+> **核心技术栈**：Rust (2024 Edition) + GPUI 0.2 + gpui-component 0.5 + Tree-sitter + rfd 0.15
 > **文档定位**：架构心智模型、核心设计模式、Windows 原生集成避坑指南、重难点深度剖析及高频面试考点。
 
 ---
@@ -480,3 +480,273 @@ fn batch_close_tabs(&mut self, kind: CloseTabsKind, target_index: usize, window:
     }
 }
 ```
+
+
+---
+
+## 13. 列编辑纯函数算法与 GPUI 输入组件协同交互实践
+
+在桌面文本编辑器中，列编辑（Column/Block Editing）是一项硬核的高级特性。实现列编辑的核心在于**将编辑意图抽象为无状态的三维矩阵运算**，并与 GPUI 实体上下文流畅结合。
+
+### 13.1 纯函数矩阵操作算法设计
+
+不要在 UI 事件回调里直接零散地拼凑字符串，而是将多行相同列的插入、序号填充与矩形裁剪抽象为纯函数：
+
+```rust
+pub fn apply_column_insert(
+    original: &str,
+    start_line: usize,
+    end_line: usize,
+    col: usize,
+    width: usize,
+    insert_text: &str,
+) -> String {
+    let crlf = original.contains("\r\n");
+    let normalized = original.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let min_line = start_line.min(end_line);
+    let max_line = start_line.max(end_line).min(lines.len().saturating_sub(1));
+
+    let mut out_lines = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i >= min_line && i <= max_line {
+            let mut chars: Vec<char> = line.chars().collect();
+            // 核心要点：如果当前行字符长度短于目标列，垫齐空格以保证纵向垂直对齐
+            if chars.len() < col {
+                chars.extend(std::iter::repeat(' ').take(col - chars.len()));
+            }
+            let left: String = chars[..col].iter().collect();
+            let right_start = (col + width).min(chars.len());
+            let right: String = chars[right_start..].iter().collect();
+            out_lines.push(format!("{}{}{}", left, insert_text, right));
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    let sep = if crlf { "\r\n" } else { "\n" };
+    out_lines.join(sep)
+}
+```
+
+### 13.2 避坑指南：短行与空行的空格填充对齐
+在列编辑中，最容易出现的 BUG 是：用户选了第 1~5 行的第 10 列，但第 3 行只有 4 个字符甚至是空行。如果不执行 `chars.extend(repeat(' ').take(col - len))`，第 3 行的插入就会错位贴在第 4 个字符后，破坏垂直对齐。因此，**先做矩阵垫齐、再做切片拼接**是列编辑几何对齐的关键。
+
+### 13.3 GPUI InputState 与面板协同交互
+1. **辅助输入框配置**：辅助输入框应配置 `placeholder` 和 `cleanable(true)`。
+2. **快捷键与事件捕获**：
+   - 使用 `KeyBinding::new("alt-c", ToggleColumnMode, None)`；
+   - 监听 `on_key_down` 的 `enter` 键，在用户按下回车时直接触发 `apply_column_insert_text`；
+   - 监听 `escape` 键实现优雅平滑的退出。
+
+
+---
+
+## 14. 原位多列光标无弹窗交互与现代编辑器（VS Code / Sublime / Bompad）体验实践
+
+### 14.1 为什么弹窗列编辑是反直觉的？
+在 GUI 文本编辑器中，列编辑（Column Mode）的核心体验是**上下文不丢失**。如果弹出一个独立对话框或悬浮输入框，用户的视线就会从代码行转移到输入框上，不仅无法看到字符插入时多行的即时对齐效果，而且会丢失光标精确位置。
+现代编辑器（如 VS Code、Sublime Text）的交互标准是：**在当前视口内直接渲染多根并存的列光标，按键输入直接在代码内部就地应用**。
+
+### 14.2 GPUI 下原位多光标 Canvas 渲染实现
+在 GPUI 中，单行文本框通常只有一个光标。要呈现多行光标，最优雅高效的手段是在编辑区上方叠加一层透明的 `canvas` 覆盖层：
+
+```rust
+// 遍历所有被列编辑贯穿的行，计算出每一行的 x / y 坐标
+for r in &rows {
+    let row_origin = point(bounds.origin.x, bounds.origin.y + px(r.y));
+
+    // 1. 每行绘制矩形竖线光标（T-cap 增强质感）
+    let caret_bounds = Bounds::new(
+        point(bounds.origin.x + px(r.caret_x), row_origin.y + px(1.0)),
+        size(px(2.0), px(r.height - 2.0)),
+    );
+    window.paint_quad(fill(caret_bounds, rgb(0x38bdf8)));
+
+    // 2. 若存在多列选区宽度，绘制半透明背景矩形
+    if r.box_width > 0.0 {
+        window.paint_quad(fill(
+            Bounds::new(point(bounds.origin.x + px(r.box_x), row_origin.y), size(px(r.box_width), px(r.height))),
+            rgba(0x38bdf826),
+        ));
+    }
+}
+```
+
+### 14.3 基于 `.capture_key_down` 的零延迟多光标按键拦截
+在主编辑区外层通过 `.capture_key_down` 截获按键，在列模式激活时优先消费输入，并调用 `cx.stop_propagation()` 防止单光标 Input 组件重复插入：
+
+```rust
+div()
+    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+        if this.handle_editor_key_down(event, window, cx) {
+            cx.stop_propagation();
+        }
+    }))
+    .child(Input::new(&self.input))
+    .children(self.column_mode.then(|| self.column_cursors_overlay(cx)))
+```
+
+### 14.4 Bompad 状态栏切换体验
+借鉴 Bompad 的极简高效设计，在状态栏直接将文本标签变为交互按钮：
+- 点击编码：在 `UTF-8` 与 `UTF-8 BOM` 之间自由切换；
+- 点击换行符：在 `CRLF`（Windows）与 `LF`（Unix）之间即时转换全文换行符；
+- 点击行列号：立即呼出 `Ctrl+G` 跳转面板。
+
+---
+
+## 15. 解决列编辑多光标与组件原生光标双重显示的视觉冲突
+
+### 15.1 问题成因深度剖析
+在基于三方或通用 UI 框架（如 `gpui-component::input`）开发多光标/列编辑功能时，极易陷入一个典型的视觉陷阱：
+- 底层编辑组件（`Input`）自身维护了一套成熟的单光标生命周期（包含 `FocusHandle`、`BlinkCursor`、输入法 IME 与渲染通道）。
+- 外层自定义的列光标系统（`column_cursors_overlay`）在主视图上方绘制一组多行光标。
+- **结果**：当多光标激活时，底层的单光标并未被自动感知或停用，仍在原地闪烁，导致界面上同时出现**两类不同来源、不同闪烁频率、不同颜色**的光标。
+
+### 15.2 解决方案与最佳实践
+直接修改三方库私有字段通常会导致版本分叉与升级困难。最优解是通过组件暴露的主题通道或焦点机制进行协同：
+1. **全局主题 Caret 隐形通道**：
+   ```rust
+   // 进入列编辑模式：隐藏底层原生单光标
+   Theme::global_mut(cx).caret = rgba(0x00000000).into();
+
+   // 退出列编辑模式：恢复原生单光标并定位到目标位置
+   Theme::global_mut(cx).caret = rgb(0xffffff).into();
+   self.input.update(cx, |state, cx| {
+       state.set_cursor_position(Position { line: target_line as u32, character: target_col as u32 }, window, cx);
+       state.focus(window, cx);
+   });
+   ```
+2. **列光标几何渲染的极简原则**：
+   - 避免在每根列光标上添加多余的装饰横线（T-cap）或行号提示块，否则与普通光标差异过大，显得杂乱；
+   - 采用标准 2.0px 宽的垂直高亮色块（如 `#38bdf8`），并在所有行保持一致的上下呼吸空隙（如 `row_origin.y + px(2.0)`，高 `r.height - 4.0`），呈现高级统一的沉浸式编辑质感。
+
+
+---
+
+## 16. GPUI 动作拦截机制与多列缩进实践
+
+### 16.1 Action 与原始 KeyDown 的调度优先级
+GPUI 的键盘分发分两步：
+1. 先根据当前上下文在 Keymap 中匹配 Action。如果匹配成功，直接把 Action 派发给节点并返回，**不再进入 KeyDown 事件阶段**。
+2. 只有未匹配到 Action 时，才会向外派发 `KeyDownEvent`。
+
+在 `gpui-component::input` 中，`tab` 与 `shift-tab` 已被注册为 `IndentInline` 和 `OutdentInline`。列编辑若只在 `capture_key_down` 里拦截 `tab`，实际按键会被组件的 Action 抢先消费，表现为只有单光标所在的第一行插入了缩进。
+
+### 16.2 父容器使用 `capture_action` 提前拦截
+要在列编辑中处理 Tab、Shift-Tab、Backspace 和 Delete，应在编辑区父容器通过 `capture_action` 在 Capture 阶段拦截，并在消费后停止传播：
+
+```rust
+div()
+    .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+        if this.column_mode {
+            this.apply_column_char_insert("    ", window, cx);
+            cx.stop_propagation();
+        }
+    }))
+    .capture_action(cx.listener(|this, _: &OutdentInline, window, cx| {
+        if this.column_mode {
+            this.apply_column_outdent(window, cx);
+            cx.stop_propagation();
+        }
+    }))
+    .child(Input::new(&self.input))
+```
+
+在非列编辑模式下不调用 `stop_propagation()`，Action 会继续向下流动，保证原有单光标缩进行为不受影响。
+
+
+---
+
+## 17. GPUI 复合容器内边距叠加陷阱与覆盖层光标像素级对齐经验
+
+### 17.1 现象与根因：覆盖层绝对定位为何总是漂移？
+在 GPUI 中，当为一个已有复合组件（如 `Input`）叠加自定义 Canvas 覆盖层（Overlay）时，极易发生“覆盖层位置整体偏离”的 BUG。
+**原因剖析**：
+1. **多层内边距隐形叠加**：
+   - 父容器设置了 `.px_3()`（12px）；
+   - 子组件 `Input` 内部有自己的主题尺寸规则（`input_px(Size::Medium) = 12px`，`input_py(Size::Medium) = 8px`）；
+   - 最终真正承载字形绘制的 `TextElement` 实际起始原点在 `(24px, 8px)`；
+   - 若覆盖层只写 `.top_0().left(px(12.))`，Canvas 的 `(0, 0)` 就比文字原点向左偏了 12px，向上偏了 8px！
+2. **光标尺寸粗细不一的异物感**：
+   - 原生光标通常定义在组件深处（如 `CURSOR_WIDTH = px(1.5)`，高 `0.85 * line_height`）；
+   - 手动绘制时若随意使用 `2.0px` 或 `line_height - 4.0px`，会导致光标不仅位置错位，而且粗笨突兀，上下留白不对称。
+
+### 17.2 解决模式：精准边界投射与 1:1 度量还原
+```rust
+// 覆盖层容器精准抵消外层与内部组件的内边距和边框
+div()
+    .id("column-cursors-overlay")
+    .absolute()
+    .top(px(8.))     // 对齐 Input 的 input_py
+    .left(px(24.))   // 对齐 父容器 px_3 (12px) + Input input_px (12px)
+    .right(px(24.))
+    .bottom(px(16.))
+    .child(canvas(
+        move |_, _, _| {},
+        move |bounds, _, window, _| {
+            let line_h = f32::from(window.line_height());
+            // 严格对齐 gpui-component 原生度量
+            let cursor_h = 0.85 * line_h;
+            let cursor_w = 1.5f32;
+            let cursor_y_offset = (line_h - cursor_h) / 2.0;
+            // ...
+        }
+    ))
+```
+- **核心原则**：覆盖层定位必须以目标组件内部真实文字流的实际偏移为基准，光标宽度与高度严格保持与原生输入组件相同的几何比例。
+
+
+
+## 18. 覆盖层行高必须与组件一致
+
+gpui-component 的 Input 固定 line_height 为 1.25rem（约 20px）。在 canvas 中调用 window.line_height() 取到的是外层继承的默认行高（约 1.6 倍字号），逐行叠加后多行光标位置和高度都会漂移。覆盖层应使用 rem_size * 1.25，与 Input 保持一致。
+
+## 19. 列编辑覆盖层必须与 Input 共享同一视口坐标系
+
+列编辑通常需要在现有文本组件上画多根光标。最容易出现的错误是把覆盖层当成独立编辑器：它用自己的行高、自己的滚动位置和自己的内容边距。短文本看起来可能正常，滚动或编辑几十行后就会产生明显漂移。
+
+### 推荐做法
+
+```rust
+struct Editor {
+    column_mode: bool,
+    column_scroll_y: f32,
+    // ...
+}
+
+let line_height = f32::from(window.rem_size()) * 1.25;
+let content_top = 8.0;
+let y = content_top + row as f32 * line_height - column_scroll_y;
+```
+
+要点如下：
+
+- 先确认目标组件的真实内容内边距和行高。`window.line_height()` 可能代表外层默认排版行高，不一定等于代码输入组件的行高。
+- 覆盖层只保留一个视口偏移；不要同时叠加 `Input` 的滚动估算、自己的滚动容器和额外的 cursor offset。
+- 绘制前按 `y + line_height < 0` 或 `y > viewport_height` 裁剪，避免大量不可见光标参与绘制。
+- 水平位置仍应使用代码字体的实际 shaping 宽度；短行超出文本末尾时，再按等宽字符宽度补齐。
+- 测试至少覆盖：首行、滚动后的中间行、底部边界、不同长度的行，以及列宽为零和非零两种情况。
+
+### 排查顺序
+
+1. 先确认光标是否整体偏移：检查内容顶部和左右内边距。
+2. 再确认是否逐行漂移：检查覆盖层行高是否与 `Input` 一致。
+3. 最后检查滚动后偏移：确认所有 Y 坐标只减去同一个视口偏移。
+
+这个顺序比不断调整光标宽高更有效，因为位置错误通常来自坐标系不一致，而不是 Canvas 矩形尺寸本身。
+
+
+## 2026-11-10 列编辑桌面实测记录
+
+在临时 100 行文档中实测：Tab 能同时缩进选中行；通过剪贴板输入单行文本时只修改主光标行；列光标未清晰显示。发现覆盖层内部 Canvas 缺少显式尺寸，本次设置 `.size_full()`；同时在父容器捕获 Paste，将单行剪贴板文本分发给列插入逻辑。多行剪贴板仍沿用组件默认行为。滚动偏移仍为事件镜像，尚未取得 Input 内部真实布局快照；不能据此声称滚动后像素对齐已验收。
+
+
+## 2026-11-10：保留真实布局坐标，修复列选区行范围扩展
+
+用户确认当前 X/Y 定位正确。当前实际实现通过本地 gpui-component 的 `InputState::column_caret_bounds` 读取真实布局、字形和可见行坐标；这替代了上文历史方案中的手工内边距及滚动镜像估算，后续不要退回估算坐标。
+
+默认列模式以两行为起点，但不应将其误当成范围上限。输入组件将 Shift+方向键绑定到 SelectUp/Down/Left/Right，Action 分发会绕过父层 KeyDown；列模式需在 Capture 阶段拦截这些 Action 并扩展列选区。补齐 Ctrl+Alt+Up/Down 绑定；工具栏切换后恢复正文焦点；首次向上扩展应从当前行向上。普通上下键仍移动整组选区，Shift+上下键改变范围。
+
+本次保持 column_cursors_overlay 及 column_caret_bounds 坐标和尺寸实现不变。测试增加连续扩展十行后批量插入/删除，以及向上跨锚点和文档边界约束；GUI 实测结果以本轮最终汇报为准。
+
+本轮验证结果：36 项测试通过；桌面实测 Shift+Down 从两行扩展至四行，物理 x 按键同时修改四行，列光标随输入向右移动。十行连续扩展及批量插入/删除由自动化测试覆盖。桌面文字注入（输入法提交路径）仍只修改主行，属于未修复的独立限制。原 alia.exe 被运行进程占用，因此本次构建交付 alia-column.exe，保留原窗口。

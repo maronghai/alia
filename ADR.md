@@ -1,9 +1,9 @@
 # 架构决策记录 (Architecture Decision Records - ADR)
 
-**项目名称**：alia 文本编辑器 (alia)  
-**目标平台**：Windows (x86_64)  
-**核心技术栈**：Rust (2024 Edition) + GPUI 0.2 + gpui-component 0.5 + Tree-sitter + rfd 0.15  
-**文档状态**：已批准 (Approved) / 活跃维护中  
+**项目名称**：alia 文本编辑器 (alia)
+**目标平台**：Windows (x86_64)
+**核心技术栈**：Rust (2024 Edition) + GPUI 0.2 + gpui-component 0.5 + Tree-sitter + rfd 0.15
+**文档状态**：已批准 (Approved) / 活跃维护中
 
 ---
 
@@ -323,3 +323,170 @@ IDE/编辑器需要提供左侧文件树，支持按需展开/折叠、状态缓
 ### 影响与评估 (Consequences)
 - 24 项单元测试覆盖了边界值（最左侧、最右侧、单 Tab、逆序索引精确匹配）；
 - 杜绝了批量操作时的索引漂移 BUG，保障了用户未保存文档的安全性。
+
+
+## ADR-013：列编辑模式（Column Mode）与矩形块选区操作
+
+### 背景 (Context)
+在编写结构化配置（YAML、JSON、TOML）、Markdown 表格、数据对齐以及代码批量加注释或补齐序号时，单光标行编辑效率低下。用户迫切需要类似 Sublime Text / VS Code / Notepad++ 的列块编辑（Column / Block Mode）能力，包括：
+1. 指定行范围（Line Range）与指定列位置（Column Offset）；
+2. 批量在多行相同列插入自定义文本（如 `// `、空格缩进、特定标签）；
+3. 批量生成带递增步长与前导零（Zero-padding）的序列数字（如 `01`、`02`、`03`）；
+4. 矩形列选块宽度删除（Delete Box）；
+5. 保持 Windows CRLF 与 Linux LF 换行风格与短行自动补空格对齐。
+
+### 决策 (Decision)
+1. **三维纯函数列编辑算法体系 (`apply_column_insert`, `apply_column_numbers`, `apply_column_delete`)**：
+   - 算法保持无副作用、纯输入输出：接收原始文本 `&str`、起始行 `start_line`、结束行 `end_line`、列偏移 `col`、选区宽度 `width`。
+   - **自动空格垫齐机制**：当某一行的字符长度不足以达到目标列 `col` 时，自动利用 `std::iter::repeat(' ').take(col - chars.len())` 填充空格，保证所有选中的行在视觉上严格垂直对齐。
+   - **CRLF 风格保真**：统一标准化处理并在拼接时还原原有的换行分隔符（`\r\n` 或 `\n`）。
+   - **矩形选块替换与删除**：根据 `chars[..col]`、`insert_str`、`chars[(col+width).. ]` 重新组合切片，删除操作将 `insert_str` 设为空，即高效完成矩形列块裁切。
+2. **轻量交互与专注面板 (`column_editor_panel`)**：
+   - 顶部工具栏提供直观的高亮按钮 `Column (Alt+C)`，激活时变为亮蓝态 `Column: ON (Alt+C)`；
+   - 开启时弹出专用列编辑控制台，提供：
+     - 当前选区状态反馈（`Lines: L1..L10 (10 lines) | Column: 5 | Width: 0`）；
+     - 调整微调工具（`+Line`、`-Line`、`+Col`、`-Col`、`+Width`、`-Width`、`Close (Esc)`）；
+     - 专用输入框 `column_input`（支持回车快捷应用）；
+     - 一键预设芯片（`// Comment`、`4 Spaces`、`1, 2, 3...`、`01, 02...`、`Delete Box`）；
+   - 快捷键深度联动：
+     - `Alt+C`：一键开启 / 关闭列编辑模式；
+     - `Alt+Shift+Down` / `Alt+Shift+Up`：扩展 / 缩减行选区；
+     - `Alt+Shift+Right` / `Alt+Shift+Left`：调整列块宽度；
+     - `Esc`：安全退出列编辑模式并返回常规编辑。
+
+### 影响与评估 (Consequences)
+- 25 项单元测试全面覆盖列插入、自动空格补齐对齐、序列数字递增格式化与矩形块删除；
+- 极大增强了程序员处理矩阵数据、结构化文本与批量重构的生产力。
+
+---
+
+## ADR-014: 原位多列光标无弹窗交互与 VS Code / Sublime / Bompad 式轻量体验演进
+
+### 背景 (Context)
+在早期的列编辑实现中，曾尝试采用弹窗或独立输入框的形式接受批量输入，但这种交互严重脱离了文本编辑器的直观操作直觉。程序员在 VS Code、Sublime Text 或 JetBrains 中使用列编辑时，习惯的是：
+1. **原位多光标视觉感知**：在每一个被选中的编辑行上，均能清晰看到一条闪烁或高亮的竖线列光标，并带有微型 T-cap 和主光标行焦点；
+2. **零弹窗无缝输入**：不需要切换到任何独立输入框，直接在代码中按键输入字符、空格、退格或删除，所有列光标贯穿的行同时原地响应；
+3. **快捷键与轻量直观交互**：
+   - `Alt+C` 或 `Ctrl+Alt+Down` / `Up` 随时唤出多列光标，按 `Esc` 立即退出；
+   - 状态栏直接显示当前多光标行数与列位置；
+   - 借鉴 Bompad 的极简高效体验：状态栏点击 `UTF-8` / `UTF-8 BOM` 直接切换编码；点击 `CRLF` / `LF` 直接无损转换换行符；
+   - 借鉴 VS Code / Sublime 体验：鼠标中键点击直接关闭 Tab，双击 Tab 栏空白处新建文档，`Ctrl+G` 直观跳转指定行。
+
+### 决策 (Decision)
+1. **原位多光标渲染体系 (`column_cursors_overlay`)**：
+   - 彻底废除任何独立输入框弹窗，全部改为在主编辑区视口上方以 `canvas` 覆盖层精准绘制多行列光标；
+   - 每一行计算精确的 `caret_x` 与 `row_origin.y`，绘制高对比度亮青色（`#38bdf8`）竖线光标与上下 T-cap，主光标行施加专属高亮强化；
+   - 纵向绘制一条轻微半透明导线标示多行垂直对齐轴，行号边缘绘制对应行的高亮标记；
+   - 若选区宽度大于 0，在每行渲染半透明选区矩形与微边框。
+2. **事件捕获级直接编辑 (`handle_editor_key_down`)**：
+   - 在编辑区容器使用 `.capture_key_down` 监听按键：
+     - 普通可打印字符、空格、Tab：通过 `apply_column_char_insert` 在所有选定行同时原地插入字符，光标同时向右推进；
+     - 退格键（Backspace）：所有行原地删除左侧字符，光标同时向左推进；
+     - 删除键（Delete）：所有行原地删除右侧字符或裁剪选区矩形；
+     - 方向键（Up/Down/Left/Right）与 Shift 组合键：原地平移多光标或动态扩展选区行；
+     - Esc：退出列编辑并恢复单光标。
+3. **Bompad 与 VS Code 经典体验集成**：
+   - 状态栏右下角编码（`UTF-8` / `UTF-8 BOM`）与换行符（`CRLF` / `LF`）均支持鼠标点击即时切换；
+   - Tab 栏支持鼠标中键点击关闭 Tab，双击空白处新建 `Untitled` 标签页；
+   - 全局支持 `Ctrl+G` 跳转行号。
+
+### 影响与评估 (Consequences)
+- 彻底摒弃了弹窗带来的交互割裂感，完全符合现代顶尖编辑器多光标交互规范；
+- 保持了底层纯函数三维数据结构的无损保真与高性能。
+
+---
+
+## ADR-015: 列编辑光标纯粹化与底层原生单光标隐形治理 (Unified Column Cursors & Native Caret Suppression)
+
+### 背景 (Context)
+在引入原位多光标列编辑功能后，发现编辑区同时渲染了两类光标：
+1. **底层 `Input` 组件原生单光标**：由于底层 `Input` 处于聚焦状态，其内部由 `BlinkCursor` 驱动、以 `cx.theme().caret` 颜色在原单光标位置持续绘制白色闪烁光标；
+2. **顶层 `column_cursors_overlay` 列光标组**：在被选中的所有编辑行上额外绘制青色多列竖线光标。
+
+这导致主光标行（或选区错位时）同时出现两类完全不同的光标（一类原光标闪烁，一类列光标叠加），甚至带有重影和不协调的 T-cap 横线，造成视觉混淆与操作干扰。
+
+### 决策 (Decision)
+1. **底层原生 Caret 隐形机制 (Dynamic Caret Suppression)**：
+   - 在列编辑模式激活期间（`self.column_mode == true`），将全局主题中的光标颜色动态调整为完全透明：`Theme::global_mut(cx).caret = rgba(0x00000000).into()`；
+   - 底层 `Input` 组件内部在绘制光标时，填充完全透明的色块，原生单光标彻底隐形，从根本上消除了“两类光标并存”的问题；
+   - 当退出列编辑模式（按 `Esc`、点击工具栏按钮或完成列操作）时，恢复 `Theme::global_mut(cx).caret = rgb(0xffffff).into()`，并将原生光标精准同步至当前列编辑主光标位置 `(target_line, target_col)`，无缝恢复常规单光标体验。
+2. **列光标样式纯粹化 (Clean Modern Vertical Bar)**：
+   - 彻底移除容易引发异物感的 T-cap（工字横梁）与行号右侧微型标记条；
+   - 每一行统一渲染高对比亮青色（`#38bdf8` / `#67e8f9ee`）纯竖线（宽 2.0px），严格对齐 VS Code / Sublime Text 的优雅现代多光标标准。
+
+### 影响与评估 (Consequences)
+- 彻底解决了多光标列编辑时两类光标重叠与错位的显示 BUG；
+- 光标视觉纯粹干脆，过渡自然顺畅。
+
+
+## ADR-016：列编辑 Tab/Shift-Tab Action 捕获与多行缩进一致性
+
+### 背景
+GPUI 会优先把 Tab 和 Shift-Tab 匹配为 `InputState` 的 `IndentInline` 与 `OutdentInline` Action，因此它们不会进入普通 `KeyDownEvent` 流程。列编辑原先只在按键事件中处理 Tab，导致只有底层单光标所在行发生缩进。
+
+### 决策
+- 在编辑区父容器使用 `capture_action`，在 Capture 阶段优先拦截 `IndentInline`、`OutdentInline`、`Backspace` 和 `Delete`。
+- 列编辑模式下，Tab 调用 `apply_column_insert` 为所有选中行插入四个空格，并把列光标整体右移；Shift-Tab 调用 `apply_column_outdent`，按所有行共同可移除的空格数反向缩进并整体左移光标。
+- 普通编辑模式不停止 Action 传播，继续使用 `InputState` 的原生单光标行为。
+- 新增 CRLF、短行补齐、边界列和多行同步测试。
+
+### 影响
+列编辑中的 Tab 与 Shift-Tab 不再被单光标缩进逻辑抢占，所有选中行保持一致，普通编辑行为不受影响。
+
+
+## ADR-017：多列光标像素级坐标对齐与原生尺寸规整 (Pixel-perfect Column Cursor Metrics & Layout Alignment)
+
+### 背景 (Context)
+在列编辑模式下，用户反馈“编辑多行时，光标的位置和大小都不对”：
+1. **坐标基准偏移（Position Disalignment）**：
+   - 覆盖层此前绝对定位在父容器的 `(12px, 0px)`，但父容器带有 `px_3()`（12px），且底层 `Input` 组件自带 `input_px`（12px）与 `input_py`（8px）。
+   - 实际文字渲染起点位于 `(24px, 8px)`，导致所有列光标整体向左偏移 12px、向上偏移 8px，完全悬浮错位。
+2. **尺寸与居中偏差（Size Mismatch）**：
+   - 原光标绘制宽度为 2.0px（原生 `CURSOR_WIDTH` 为 1.5px），显得粗钝；
+   - 原光标高度固定为 `line_h - 4.0px`，而原生为 `0.85 * line_height`，导致上下留白不对称；
+   - 行号槽宽度未完全对齐 `empty_line_number.width + px(6.) + px(10.)`。
+
+### 决策 (Decision)
+1. **精确内边距匹配**：将覆盖层绝对定位校准为 `.top(px(8.)).left(px(24.)).right(px(24.)).bottom(px(16.))`，实现 Canvas 绘制边界与 `TextElement` 真实文字内容视口 1:1 完全对齐。
+2. **1:1 原生度量规整**：
+   - 光标宽度锁定为 `1.5px`（完全匹配 `gpui_component::input::blink_cursor::CURSOR_WIDTH`）；
+   - 光标高度统一为 `0.85 * line_height`，垂直偏移为 `(line_height - cursor_height) / 2.0`，严格垂直居中；
+   - 多行微导线（Alignment Guideline）与选区矩形同步对齐。
+3. **行号与文本步进统一**：根据字形系统动态测量 `shape("+".repeat(digits)).width + 6.0 + 10.0`，并在每行依据 `shape(&text[..byte_idx]).width` 准确计算字符横向排版点。
+
+### 影响与评估 (Consequences)
+- 32 项单元测试全绿；多列光标位置与字符位置严格吻合，粗细与高度和单光标完全一致。
+
+## ADR-018：列编辑覆盖层采用单一视口偏移模型
+
+### 背景
+
+列编辑的多光标由额外的 Canvas 覆盖层绘制，而正文由 `gpui-component` 的 `Input` 渲染。`InputState` 的滚动句柄和最后一次布局信息属于组件内部实现，外部覆盖层无法直接读取。覆盖层如果只用“行号 × 行高”计算 Y 坐标，在编辑器滚动后就会与文字逐渐分离；如果再单独维护另一套完整滚动模型，又会出现双重滚动和边界不一致。
+
+### 决策
+
+- 覆盖层只维护一个 `column_scroll_y`，把它作为编辑区内容坐标到视口坐标的唯一垂直偏移。
+- 列光标的 Y 坐标统一按 `content_top + row * input_line_height - column_scroll_y` 计算。
+- `content_top` 与编辑器输入组件的垂直内边距保持一致；行高使用 `gpui-component` Input 的 `rem_size * 1.25` 约定。
+- 编辑区滚轮事件只更新这一个偏移，并在绘制时裁剪视口外的光标；不再引入第二个嵌套滚动容器。
+- 正常编辑模式仍完全交给 `InputState`，列模式关闭时恢复原生单光标。
+
+### 影响
+
+这种设计让多行列光标共享明确的内容坐标系，避免行号增加或滚轮滚动带来的累计漂移。它依赖 `Input` 当前的固定行高和编辑区滚轮事件；如果未来 `gpui-component` 暴露正式的布局快照，应优先替换镜像状态，而不改变列编辑算法。
+
+
+## 2026-11-10 列编辑桌面实测记录
+
+在临时 100 行文档中实测：Tab 能同时缩进选中行；通过剪贴板输入单行文本时只修改主光标行；列光标未清晰显示。发现覆盖层内部 Canvas 缺少显式尺寸，本次设置 `.size_full()`；同时在父容器捕获 Paste，将单行剪贴板文本分发给列插入逻辑。多行剪贴板仍沿用组件默认行为。滚动偏移仍为事件镜像，尚未取得 Input 内部真实布局快照；不能据此声称滚动后像素对齐已验收。
+
+
+## 2026-11-10：保留真实布局坐标，修复列选区行范围扩展
+
+用户确认当前 X/Y 定位正确。当前实际实现通过本地 gpui-component 的 `InputState::column_caret_bounds` 读取真实布局、字形和可见行坐标；这替代了上文历史方案中的手工内边距及滚动镜像估算，后续不要退回估算坐标。
+
+默认列模式以两行为起点，但不应将其误当成范围上限。输入组件将 Shift+方向键绑定到 SelectUp/Down/Left/Right，Action 分发会绕过父层 KeyDown；列模式需在 Capture 阶段拦截这些 Action 并扩展列选区。补齐 Ctrl+Alt+Up/Down 绑定；工具栏切换后恢复正文焦点；首次向上扩展应从当前行向上。普通上下键仍移动整组选区，Shift+上下键改变范围。
+
+本次保持 column_cursors_overlay 及 column_caret_bounds 坐标和尺寸实现不变。测试增加连续扩展十行后批量插入/删除，以及向上跨锚点和文档边界约束；GUI 实测结果以本轮最终汇报为准。
+
+本轮验证结果：36 项测试通过；桌面实测 Shift+Down 从两行扩展至四行，物理 x 按键同时修改四行，列光标随输入向右移动。十行连续扩展及批量插入/删除由自动化测试覆盖。桌面文字注入（输入法提交路径）仍只修改主行，属于未修复的独立限制。原 alia.exe 被运行进程占用，因此本次构建交付 alia-column.exe，保留原窗口。
