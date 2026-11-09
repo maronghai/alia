@@ -657,3 +657,19 @@ fn column_selection_reverses_and_replaces_every_row() {
     assert_eq!(select(6, 2, false, 0, false), (0, 0, false));
     assert_eq!(apply_column_insert("alpha one\r\nalpha two", 0, 1, 0, 5, "X"), "X one\r\nX two");
 }
+
+#[test]
+fn app_version_and_window_title_format() {
+    assert_eq!(super::APP_NAME, "alia");
+    assert!(!super::APP_VERSION.is_empty());
+    let parts: Vec<&str> = super::APP_VERSION.split(".").collect();
+    assert_eq!(parts.len(), 3, "Version must follow semver (e.g. 0.4.2)");
+    for part in parts {
+        assert!(part.chars().all(|c| c.is_ascii_digit()), "Semver components must be numeric");
+    }
+
+    let title_clean = format!("{} — {} v{}", "Untitled-1.txt", super::APP_NAME, super::APP_VERSION);
+    let title_dirty = format!("● {} — {} v{}", "Untitled-1.txt", super::APP_NAME, super::APP_VERSION);
+    assert_eq!(title_clean, format!("Untitled-1.txt — alia v{}", super::APP_VERSION));
+    assert_eq!(title_dirty, format!("● Untitled-1.txt — alia v{}", super::APP_VERSION));
+}

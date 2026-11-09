@@ -6,6 +6,9 @@ use gpui_component::{
     Root, Theme, ThemeMode,
     input::{Backspace, Delete, IndentInline, Input, InputEvent, InputState, OutdentInline, Position, RopeExt},
 };
+
+pub const APP_NAME: &str = "alia";
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::{
     cell::{Cell, RefCell},
@@ -2510,9 +2513,11 @@ impl Render for Editor {
         let dirty = self.dirty_cached;
         let name = self.document_name(self.active_tab);
         let title = format!(
-            "{}{} — alia",
+            "{}{} — {} v{}",
             if dirty { "● " } else { "" },
-            name
+            name,
+            APP_NAME,
+            APP_VERSION
         );
         if self.last_window_title != title {
             window.set_window_title(&title);
@@ -2563,11 +2568,24 @@ impl Render for Editor {
                     .border_color(rgb(0x303b50))
                     .child(
                         div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
                             .mr_4()
-                            .text_color(rgb(0x60a5fa))
-                            .child("alia"),
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(0x60a5fa))
+                                    .child(APP_NAME),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(rgb(0x64748b))
+                                    .child(format!("v{}", APP_VERSION)),
+                            ),
                     )
                     .child(tool("toggle-tree", "Explorer").on_click(
                         cx.listener(|this, _, w, cx| this.toggle_tree(&ToggleTree, w, cx)),
@@ -2856,6 +2874,13 @@ impl Render for Editor {
                                 div()
                                     .text_color(rgb(0x475569))
                                     .child("Ctrl+G Jump | Ctrl+F Find"),
+                            )
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .text_color(rgb(0x64748b))
+                                    .child(format!("v{}", APP_VERSION)),
                             ),
                     ),
             )
@@ -2928,7 +2953,7 @@ fn main() {
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("alia".into()),
+                    title: Some(format!("{} v{}", APP_NAME, APP_VERSION).into()),
                     ..Default::default()
                 }),
                 window_min_size: Some(size(px(720.), px(420.))),
