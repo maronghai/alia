@@ -7,6 +7,13 @@ use gpui_component::{
     input::{Backspace, Delete, IndentInline, Input, InputEvent, InputState, OutdentInline, Position, RopeExt},
 };
 
+const EXPLORER_DEFAULT_WIDTH: f32 = 240.0;
+
+fn explorer_width(requested: f32, viewport: f32) -> f32 {
+    let maximum = (viewport - 320.0).clamp(180.0, 600.0);
+    requested.clamp(180.0, maximum)
+}
+
 pub const APP_NAME: &str = "alia";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -638,6 +645,8 @@ struct Editor {
     tree_cache: HashMap<PathBuf, Vec<TreeEntry>>,
     expanded: HashSet<PathBuf>,
     tree_visible: bool,
+    tree_width: f32,
+    tree_resize: Option<(f32, f32)>,
     minimap_visible: bool,
     minimap_dragging: bool,
     tree_scroll_handle: UniformListScrollHandle,
@@ -812,6 +821,8 @@ impl Editor {
             tree_cache,
             expanded: HashSet::new(),
             tree_visible: true,
+            tree_width: EXPLORER_DEFAULT_WIDTH,
+            tree_resize: None,
             minimap_visible: true,
             minimap_dragging: false,
             tree_scroll_handle: UniformListScrollHandle::new(),
@@ -1672,6 +1683,25 @@ impl Editor {
         cx.notify();
     }
 
+    fn tree_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("explorer-resize-handle")
+            .w(px(6.)).h_full().flex_shrink_0()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .bg(if self.tree_resize.is_some() { rgb(0x3b82f6) } else { rgb(0x232838) })
+            .hover(|style| style.bg(rgb(0x3b82f6)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                if event.click_count >= 2 {
+                    this.tree_width = EXPLORER_DEFAULT_WIDTH;
+                    this.tree_resize = None;
+                } else {
+                    this.tree_resize = Some((f32::from(event.position.x), this.tree_width));
+                }
+                cx.notify();
+            }))
+    }
+
     fn tree_panel(&self, cx: &mut Context<Self>) -> Div {
         let root_name = self
             .tree_root
@@ -1696,7 +1726,7 @@ impl Editor {
         let count = self.flattened_tree.len();
 
         div()
-            .w(px(240.))
+            .w(px(self.tree_width))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -2534,6 +2564,26 @@ impl Render for Editor {
             .bg(rgb(0x13151b))
             .text_color(rgb(0xe2e8f0))
             .font_family("Segoe UI")
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if let Some((start_x, start_width)) = this.tree_resize {
+                    if !event.dragging() {
+                        this.tree_resize = None;
+                    } else {
+                        this.tree_width = explorer_width(
+                            start_width + f32::from(event.position.x) - start_x,
+                            f32::from(window.viewport_size().width),
+                        );
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                if this.tree_resize.take().is_some() { cx.notify(); }
+            }))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                if this.tree_resize.take().is_some() { cx.notify(); }
+            }))
             //
             .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::open_file))
@@ -2622,6 +2672,7 @@ impl Render for Editor {
                     .flex_1()
                     .min_h_0()
                     .children(self.tree_visible.then(|| self.tree_panel(cx)))
+                    .children(self.tree_visible.then(|| self.tree_resize_handle(cx)))
                     .child(
                         div()
                             .flex()

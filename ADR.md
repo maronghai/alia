@@ -494,3 +494,7 @@ GPUI 会优先把 Tab 和 Shift-Tab 匹配为 `InputState` 的 `IndentInline` �
 ### 列编辑导航补充（2026-11-10）
 
 捕获 MoveHome、MoveEnd、SelectToStartOfLine、SelectToEndOfLine 及四种词级移动/选择 Action，避免被单光标组件单独处理。矩形模式采用主操作行的边界作为整组目标列；增加反向选区状态，保持固定锚点。光标几何继续使用已校准的 column_caret_bounds 接口。38 项测试通过，未做本轮桌面交互验收。
+
+### Explorer 可调整宽度（2026-11-13）
+
+侧栏宽度由 Editor 持有，分隔线记录拖动起点与初始宽度，根容器处理移动和释放。宽度约束为 180–600 逻辑像素，尽可能给正文保留 320 像素。双击恢复 240 像素；宽度只在当前窗口内保存。拖动不重建文件树缓存，不改变列编辑坐标测量。

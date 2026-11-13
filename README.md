@@ -103,3 +103,7 @@ This project is released under the [MIT License](LICENSE).
 ### Column navigation
 
 In Column Mode, Home moves to column zero; End and Ctrl+Left/Right use the active row as the boundary reference for the entire rectangle. Hold Shift to extend the selection (including to the left). Typing replaces the rectangle on all selected rows. Mouse double-click word selection is not integrated with column mode.
+
+### Resizable Explorer
+
+Drag the right edge of Explorer to resize it (180–600 logical pixels, subject to available window space). Double-click the divider to restore the default 240-pixel width. The width is retained while toggling Explorer within the current window; it is not persisted across restarts.

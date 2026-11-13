@@ -673,3 +673,12 @@ fn app_version_and_window_title_format() {
     assert_eq!(title_clean, format!("Untitled-1.txt — alia v{}", super::APP_VERSION));
     assert_eq!(title_dirty, format!("● Untitled-1.txt — alia v{}", super::APP_VERSION));
 }
+
+#[test]
+fn explorer_resize_respects_width_and_editor_space() {
+    assert_eq!(super::explorer_width(240.0, 1200.0), 240.0);
+    assert_eq!(super::explorer_width(50.0, 1200.0), 180.0);
+    assert_eq!(super::explorer_width(900.0, 1200.0), 600.0);
+    assert_eq!(super::explorer_width(600.0, 800.0), 480.0);
+    assert_eq!(super::explorer_width(600.0, 400.0), 180.0);
+}
