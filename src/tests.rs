@@ -711,3 +711,27 @@ fn syntax_styles_survive_save_and_reparse() {
         assert_eq!(before, reparsed.styles(&(0..saved.len()), &theme));
     }
 }
+
+#[test]
+fn external_changes_reload_clean_documents_and_protect_local_edits() {
+    use super::{external_change, ExternalChange};
+    assert_eq!(external_change("old\n", false, false, false, b"new\n"), ExternalChange::Reload);
+    assert_eq!(external_change("old\n", false, false, true, b"new\n"), ExternalChange::Conflict);
+    assert_eq!(external_change("old\n", false, false, true, b"old\n"), ExternalChange::Unchanged);
+    assert_eq!(external_change("old\n", true, true, false, &super::encode_text("old\n", true, true)), ExternalChange::Unchanged);
+    assert_eq!(external_change("old\n", false, false, false, b""), ExternalChange::Reload);
+}
+
+#[test]
+fn external_file_stamp_detects_write_delete_and_recreation() {
+    let path = std::env::temp_dir().join(format!("alia-external-sync-{}.txt", std::process::id()));
+    std::fs::write(&path, b"first").unwrap();
+    let first = super::disk_stamp(&path).unwrap();
+    std::fs::write(&path, b"second, longer").unwrap();
+    assert_ne!(super::disk_stamp(&path).unwrap(), first);
+    std::fs::remove_file(&path).unwrap();
+    assert!(super::disk_stamp(&path).is_none());
+    std::fs::write(&path, b"recreated").unwrap();
+    assert!(super::disk_stamp(&path).is_some());
+    std::fs::remove_file(&path).unwrap();
+}

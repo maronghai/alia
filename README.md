@@ -107,3 +107,7 @@ In Column Mode, Home moves to column zero; End and Ctrl+Left/Right use the activ
 ### Resizable Explorer
 
 Drag the right edge of Explorer to resize it (180–600 logical pixels, subject to available window space). Double-click the divider to restore the default 240-pixel width. The width is retained while toggling Explorer within the current window; it is not persisted across restarts.
+
+### External file changes
+
+Opened files are checked in the background approximately once per second using modification time and size. Clean documents reload automatically, including encoding and syntax highlighting. Unsaved local edits are preserved and a status message reports conflicts. Saving checks disk content again and asks before overwriting external changes or recreating an unavailable file. Reload restores the cursor position where possible; full selection and scroll restoration are not guaranteed.

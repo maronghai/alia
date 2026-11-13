@@ -414,10 +414,31 @@ fn read_directory(path: &Path) -> Result<Vec<TreeEntry>, String> {
     Ok(entries)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiskStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+fn disk_stamp(path: &Path) -> Option<DiskStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(DiskStamp { modified: metadata.modified().ok(), len: metadata.len() })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExternalChange { Unchanged, Reload, Conflict }
+
+fn external_change(saved: &str, crlf: bool, bom: bool, dirty: bool, bytes: &[u8]) -> ExternalChange {
+    if encode_text(saved, crlf, bom) == bytes { ExternalChange::Unchanged }
+    else if dirty { ExternalChange::Conflict }
+    else { ExternalChange::Reload }
+}
+
 struct Document {
     input: Entity<InputState>,
     path: Option<PathBuf>,
     saved_text: String,
+    disk_stamp: Option<DiskStamp>,
     dirty_cached: bool,
     lines: usize,
     chars: usize,
@@ -791,6 +812,7 @@ impl Editor {
             input,
             path: None,
             saved_text: String::new(),
+            disk_stamp: None,
             dirty_cached: false,
             lines: 1,
             chars: 0,
@@ -846,6 +868,74 @@ impl Editor {
             }),
         };
         editor.rebuild_flattened_tree();
+        cx.spawn_in(window, async move |view, cx| {
+            loop {
+                Timer::after(std::time::Duration::from_secs(1)).await;
+                let Ok(requests) = view.update(cx, |editor, _| {
+                    editor.tabs.iter().filter_map(|doc| doc.path.clone().map(|path|
+                        (doc.untitled_id, path, doc.disk_stamp.clone()))).collect::<Vec<_>>()
+                }) else { break; };
+                let changes = cx.background_executor().spawn(async move {
+                    requests.into_iter().filter_map(|(id, path, previous)| {
+                        let stamp = disk_stamp(&path);
+                        if stamp == previous { return None; }
+                        let bytes = fs::read(&path);
+                        Some((id, path, previous, stamp, bytes))
+                    }).collect::<Vec<_>>()
+                }).await;
+                if cx.update(|window, cx| {
+                    let _ = view.update(cx, |editor, cx| {
+                        for (id, path, previous, stamp, bytes) in changes {
+                            let Some(index) = editor.tabs.iter().position(|doc|
+                                doc.untitled_id == id && doc.path.as_ref() == Some(&path)) else { continue; };
+                            let doc = &mut editor.tabs[index];
+                            // A save/open may have completed while the background read was in flight.
+                            if doc.disk_stamp != previous { continue; }
+                            doc.disk_stamp = stamp;
+                            let bytes = match bytes {
+                                Ok(bytes) => bytes,
+                                Err(_) => {
+                                    editor.message = format!("File removed or unavailable: {} — local content kept", path.display());
+                                    cx.notify();
+                                    continue;
+                                }
+                            };
+                            match external_change(&doc.saved_text, doc.crlf, doc.bom,
+                                !text_matches_saved(doc.input.read(cx), &doc.saved_text), &bytes) {
+                                ExternalChange::Unchanged => {},
+                                ExternalChange::Conflict => {
+                                    editor.message = format!("External changes: {} — local edits kept; save to resolve", path.display());
+                                    cx.notify();
+                                }
+                                ExternalChange::Reload => match decode_text(&bytes) {
+                                    Ok((text, crlf, bom)) => {
+                                        let cursor = doc.input.read(cx).cursor_position();
+                                        doc.lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
+                                        doc.chars = text.chars().count();
+                                        doc.saved_text = text.clone();
+                                        doc.crlf = crlf;
+                                        doc.bom = bom;
+                                        doc.dirty_cached = false;
+                                        *doc.minimap_cache.borrow_mut() = None;
+                                        doc.input.update(cx, |state, cx| {
+                                            state.set_value(text, window, cx);
+                                            state.set_cursor_position(cursor, window, cx);
+                                            state.refresh_highlighter(cx);
+                                        });
+                                        editor.message = format!("Reloaded external changes: {}", path.display());
+                                        cx.notify();
+                                    }
+                                    Err(err) => {
+                                        editor.message = format!("Cannot reload {}: {err} — local content kept", path.display());
+                                        cx.notify();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }).is_err() { break; }
+            }
+        }).detach();
         editor
     }
 
@@ -944,12 +1034,30 @@ impl Editor {
             );
             return false;
         }
+        if self.path.as_ref() == Some(&path) {
+            let disk = fs::read(&path);
+            let conflict = match &disk {
+                Ok(bytes) => external_change(&self.saved_text, self.crlf, self.bom, true, bytes)
+                    == ExternalChange::Conflict,
+                Err(_) => true,
+            };
+            if conflict {
+                let name = path.display().to_string();
+                let decision = native_dialog(move || MessageDialog::new()
+                    .set_title("File Changed on Disk")
+                    .set_description(format!("{name} was changed or removed outside alia. Overwrite with your local content? Choose No to keep both versions unchanged."))
+                    .set_level(MessageLevel::Warning)
+                    .set_buttons(MessageButtons::YesNo).show());
+                if !matches!(decision, Ok(MessageDialogResult::Yes)) { return false; }
+            }
+        }
         let text = self.text(cx);
         let output = encode_text(&text, self.crlf, self.bom);
         if let Err(err) = fs::write(&path, output) {
             self.error(format!("Cannot save file {}: {err}", path.display()), cx);
             return false;
         }
+        self.disk_stamp = disk_stamp(&path);
         self.path = Some(path);
         self.update_language(cx);
         self.saved_text = text;
@@ -1555,6 +1663,7 @@ impl Editor {
                 if !reuse_blank {
                     self.new_file(&NewFile, window, cx);
                 }
+                self.disk_stamp = disk_stamp(&path);
                 self.path = Some(path);
                 self.update_language(cx);
                 self.lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
