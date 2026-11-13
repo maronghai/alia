@@ -114,4 +114,4 @@ Opened files are checked in the background approximately once per second using m
 
 ### Automatic Explorer refresh
 
-Explorer checks the root and expanded directories in the background approximately once per second. Created, renamed and deleted entries appear automatically. Unchanged snapshots do not trigger redraws; expansion state and the scroll handle are retained. Collapsed directories are read when expanded. Refresh remains available for an immediate manual scan.
+Explorer checks the root and expanded directories in the background approximately once per second. Created, renamed and deleted entries appear automatically. Unchanged snapshots do not trigger redraws; expansion state and the scroll handle are retained. Collapsed directories are read when expanded. Explorer has no manual Refresh or Open Folder buttons. Use the toolbar Open menu for Open File (Ctrl+O) or Open Folder (Ctrl+Shift+O).

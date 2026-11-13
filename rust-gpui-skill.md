@@ -771,3 +771,17 @@ let y = content_top + row as f32 * line_height - column_scroll_y;
 ### Explorer 自动刷新实践
 
 目录枚举与排序放在 background_executor 中，UI 线程只应用变化快照并重建虚拟列表缓存。保留滚动句柄，不主动滚动；根路径、旧缓存和展开状态校验防止过期结果覆盖新状态。轮询只扫描根目录及展开目录，不递归扫描整个工作区；未变化不 notify。刷新周期约一秒加实际扫描耗时。
+
+
+### 统一打开入口
+
+后台自动刷新的 Explorer 不再放置手动刷新按钮；文件和文件夹入口合并到 Open 浮层菜单，复用原有对话框和快捷键。菜单使用 deferred/anchored 和 occlude，菜单项阻止鼠标事件向背景传播。
+
+### anchored 全屏遮罩尺寸
+
+全屏弹出菜单不可依赖绝对定位子元素撑开 anchored 容器。显式设置窗口原点及容器宽高，再在其中布局背景遮罩与菜单；背景使用 occlude 防止点击穿透。为 Esc 和菜单触发的动作补齐关闭状态。
+
+
+### Menu command dispatch: cancel must not reopen a dialog
+
+Context-menu items consume mouse-down without executing commands and invoke the command only on click. Binding the command to both mouse-down and click opened two native dialogs in sequence, including after Cancel. This applies to Open File, Open Folder, and tab context-menu commands.

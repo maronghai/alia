@@ -687,6 +687,7 @@ struct Editor {
     message: String,
     last_window_title: String,
     tab_context_menu: Option<TabContextMenu>,
+    open_menu_position: Option<Point<Pixels>>,
     column_mode: bool,
     column_start_line: usize,
     column_end_line: usize,
@@ -865,6 +866,7 @@ impl Editor {
             message: "Ready".into(),
             last_window_title: String::new(),
             tab_context_menu: None,
+            open_menu_position: None,
             column_mode: false,
             column_start_line: 0,
             column_end_line: 0,
@@ -1350,9 +1352,6 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if enabled {
-            let action = std::rc::Rc::new(action);
-            let action_down = action.clone();
-            let action_click = action;
             div()
                 .id(id_name)
                 .px_3()
@@ -1364,14 +1363,14 @@ impl Editor {
                 .child(label)
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, w, cx| {
+                    cx.listener(|_, _, _, cx| {
+                        // Consume the press; execute commands only once on click.
                         cx.stop_propagation();
-                        action_down(this, w, cx);
                     }),
                 )
                 .on_click(cx.listener(move |this, _, w, cx| {
                     cx.stop_propagation();
-                    action_click(this, w, cx);
+                    action(this, w, cx);
                 }))
         } else {
             div()
@@ -1526,6 +1525,44 @@ impl Editor {
         )
     }
 
+    fn open_menu_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(position) = self.open_menu_position else {
+            return div().into_any_element();
+        };
+        let x = position.x.min((window.bounds().size.width - px(280.)).max(px(0.)));
+        let y = position.y.min((window.bounds().size.height - px(88.)).max(px(0.)));
+        deferred(anchored().position(point(px(0.), px(0.))).child(
+            div().id("open-menu-layer").relative()
+                .w(window.bounds().size.width).h(window.bounds().size.height)
+                .child(div().id("open-menu-backdrop").occlude().size_full().absolute().top_0().left_0()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.open_menu_position = None;
+                        cx.notify();
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.open_menu_position = None;
+                        cx.notify();
+                    })))
+                .child(div().id("open-menu-popup").occlude().absolute().left(x).top(y)
+                    .w(px(272.)).bg(rgb(0x1a1e28)).border_1().border_color(rgb(0x323a4e))
+                    .rounded(px(6.)).shadow_lg().p_1().flex().flex_col().gap(px(2.)).text_sm()
+                    .child(self.context_menu_item("menu-open-file", "Open File…    Ctrl+O", true,
+                        |this, w, cx| {
+                            this.open_menu_position = None;
+                            this.open_file(&OpenFile, w, cx);
+                            cx.notify();
+                        }, cx))
+                    .child(self.context_menu_item("menu-open-folder", "Open Folder…    Ctrl+Shift+O", true,
+                        |this, w, cx| {
+                            this.open_menu_position = None;
+                            this.open_folder(&OpenFolder, w, cx);
+                            cx.notify();
+                        }, cx)))
+        )).into_any_element()
+    }
+
     fn tab_context_menu_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let menu = match &self.tab_context_menu {
             Some(m) => m.clone(),
@@ -1653,6 +1690,8 @@ impl Editor {
     }
 
     fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu_position = None;
+        cx.notify();
         let selected = native_dialog(|| {
             FileDialog::new()
                 .set_title("Open Text File")
@@ -1721,6 +1760,8 @@ impl Editor {
     }
 
     fn open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu_position = None;
+        cx.notify();
         let initial = self.tree_root.clone();
         match native_dialog(move || {
             let mut dialog = FileDialog::new().set_title("Open Folder");
@@ -1888,19 +1929,6 @@ impl Editor {
                     .text_color(rgb(0x94a3b8))
                     .font_weight(FontWeight::BOLD)
                     .child("EXPLORER"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .px_2()
-                    .pb_2()
-                    .child(tool("tree-open", "Open Folder").on_click(
-                        cx.listener(|this, _, w, cx| this.open_folder(&OpenFolder, w, cx)),
-                    ))
-                    .child(tool("tree-refresh", "Refresh").on_click(
-                        cx.listener(|this, _, w, cx| this.refresh_tree(&RefreshTree, w, cx)),
-                    )),
             )
             .child(
                 div()
@@ -2731,6 +2759,12 @@ impl Render for Editor {
                 if this.tree_resize.take().is_some() { cx.notify(); }
             }))
             //
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.open_menu_position.take().is_some() {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::save_file))
@@ -2798,8 +2832,17 @@ impl Render for Editor {
                             .on_click(cx.listener(|this, _, w, cx| this.new_file(&NewFile, w, cx))),
                     )
                     .child(
-                        tool("open", "Open   Ctrl+O").on_click(
-                            cx.listener(|this, _, w, cx| this.open_file(&OpenFile, w, cx)),
+                        tool("open", "Open ▾").on_mouse_down(MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_menu_position = if this.open_menu_position.is_some() {
+                                    None
+                                } else {
+                                    Some(point(event.position.x, event.position.y + px(20.)))
+                                };
+                                this.tab_context_menu = None;
+                                cx.notify();
+                            }),
                         ),
                     )
                     .child(
@@ -3083,6 +3126,7 @@ impl Render for Editor {
             )
             .children(self.goto_line_open.then(|| self.goto_line_panel(window, cx)))
             .child(self.tab_context_menu_panel(window, cx))
+            .child(self.open_menu_panel(window, cx))
     }
 }
 

@@ -513,3 +513,17 @@ GPUI 会优先把 Tab 和 Shift-Tab 匹配为 `InputState` 的 `IndentInline` �
 ### Explorer 后台自动刷新
 
 复用外部文件同步任务，每秒在后台枚举根目录与展开目录并比较排序后的目录快照，仅返回变化项。界面应用前校验工作区根路径、展开状态和旧缓存，避免覆盖并发手动刷新。更新扁平列表时保留滚动句柄与展开集合，不主动定位当前文件。读取失败保留缓存，路径消失返回空列表；扫描串行等待完成，避免任务重叠。大型或网络目录扫描耗时会延长实际刷新间隔。
+
+
+### Explorer 入口简化
+
+资源管理器依赖后台自动刷新，移除 Refresh 与 Open Folder 按钮。顶部 Open 改为文件/文件夹下拉菜单，保留 Ctrl+O 与 Ctrl+Shift+O。
+
+### Open 菜单关闭修复
+
+Open 浮层使用 anchored.position 显式定位窗口原点，容器宽高使用实际窗口尺寸，避免绝对布局和百分比尺寸造成外部点击区域失效。背景遮罩拦截点击并关闭菜单；Esc、打开文件及打开文件夹动作统一清除菜单状态。
+
+
+### Menu command dispatch: cancel must not reopen a dialog
+
+Context-menu items consume mouse-down without executing commands and invoke the command only on click. Binding the command to both mouse-down and click opened two native dialogs in sequence, including after Cancel. This applies to Open File, Open Folder, and tab context-menu commands.
