@@ -735,3 +735,29 @@ fn external_file_stamp_detects_write_delete_and_recreation() {
     assert!(super::disk_stamp(&path).is_some());
     std::fs::remove_file(&path).unwrap();
 }
+
+    #[test]
+    fn explorer_snapshots_detect_create_rename_delete_and_nested_changes() {
+        let root = std::env::temp_dir().join(format!("alia-explorer-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();
+        let empty = super::directory_snapshot(&root).unwrap();
+        assert!(empty.is_empty());
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(root.join("before.rs"), "fn main() {}" ).unwrap();
+        let created = super::directory_snapshot(&root).unwrap();
+        assert_ne!(created, empty);
+        assert!(created[0].directory);
+        assert_eq!(created, super::directory_snapshot(&root).unwrap());
+        std::fs::rename(root.join("before.rs"), root.join("after.rs")).unwrap();
+        let renamed = super::directory_snapshot(&root).unwrap();
+        assert_ne!(created, renamed);
+        assert!(renamed.iter().any(|entry| entry.name == "after.rs"));
+        std::fs::write(nested.join("child.txt"), "child").unwrap();
+        assert_eq!(super::directory_snapshot(&nested).unwrap().len(), 1);
+        std::fs::remove_file(root.join("after.rs")).unwrap();
+        assert_eq!(super::directory_snapshot(&root).unwrap().len(), 1);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(super::directory_snapshot(&root), Some(Vec::new()));
+    }

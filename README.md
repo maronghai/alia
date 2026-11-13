@@ -111,3 +111,7 @@ Drag the right edge of Explorer to resize it (180–600 logical pixels, subject 
 ### External file changes
 
 Opened files are checked in the background approximately once per second using modification time and size. Clean documents reload automatically, including encoding and syntax highlighting. Unsaved local edits are preserved and a status message reports conflicts. Saving checks disk content again and asks before overwriting external changes or recreating an unavailable file. Reload restores the cursor position where possible; full selection and scroll restoration are not guaranteed.
+
+### Automatic Explorer refresh
+
+Explorer checks the root and expanded directories in the background approximately once per second. Created, renamed and deleted entries appear automatically. Unchanged snapshots do not trigger redraws; expansion state and the scroll handle are retained. Collapsed directories are read when expanded. Refresh remains available for an immediate manual scan.

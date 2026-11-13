@@ -387,7 +387,7 @@ struct FlattenedTreeEntry {
     expanded: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TreeEntry {
     path: PathBuf,
     name: String,
@@ -412,6 +412,16 @@ fn read_directory(path: &Path) -> Result<Vec<TreeEntry>, String> {
             .then_with(|| a.name.cmp(&b.name))
     });
     Ok(entries)
+}
+
+// Enumerate on the background executor. A transient permission/I/O error must
+// not make an otherwise valid subtree disappear from the explorer.
+fn directory_snapshot(path: &Path) -> Option<Vec<TreeEntry>> {
+    match read_directory(path) {
+        Ok(entries) => Some(entries),
+        Err(_) if !path.exists() => Some(Vec::new()),
+        Err(_) => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -871,20 +881,45 @@ impl Editor {
         cx.spawn_in(window, async move |view, cx| {
             loop {
                 Timer::after(std::time::Duration::from_secs(1)).await;
-                let Ok(requests) = view.update(cx, |editor, _| {
-                    editor.tabs.iter().filter_map(|doc| doc.path.clone().map(|path|
-                        (doc.untitled_id, path, doc.disk_stamp.clone()))).collect::<Vec<_>>()
+                let Ok((requests, tree_root, directories)) = view.update(cx, |editor, _| {
+                    let directories = editor.tree_root.iter().chain(editor.expanded.iter())
+                        .map(|path| (path.clone(), editor.tree_cache.get(path).cloned()))
+                        .collect::<Vec<_>>();
+                    let requests = editor.tabs.iter().filter_map(|doc| doc.path.clone().map(|path|
+                        (doc.untitled_id, path, doc.disk_stamp.clone()))).collect::<Vec<_>>();
+                    (requests, editor.tree_root.clone(), directories)
                 }) else { break; };
-                let changes = cx.background_executor().spawn(async move {
-                    requests.into_iter().filter_map(|(id, path, previous)| {
+                let (changes, directory_changes) = cx.background_executor().spawn(async move {
+                    let directory_changes = directories.into_iter().filter_map(|(path, previous)| {
+                        let entries = directory_snapshot(&path)?;
+                        if previous.as_ref() == Some(&entries) { return None; }
+                        Some((path, previous, entries))
+                    }).collect::<Vec<_>>();
+                    let changes = requests.into_iter().filter_map(|(id, path, previous)| {
                         let stamp = disk_stamp(&path);
                         if stamp == previous { return None; }
                         let bytes = fs::read(&path);
                         Some((id, path, previous, stamp, bytes))
-                    }).collect::<Vec<_>>()
+                    }).collect::<Vec<_>>();
+                    (changes, directory_changes)
                 }).await;
                 if cx.update(|window, cx| {
                     let _ = view.update(cx, |editor, cx| {
+                        if editor.tree_root == tree_root {
+                            let mut tree_changed = false;
+                            for (path, previous, entries) in directory_changes {
+                                if (editor.tree_root.as_ref() == Some(&path) || editor.expanded.contains(&path))
+                                    && editor.tree_cache.get(&path) == previous.as_ref() {
+                                    editor.tree_cache.insert(path, entries);
+                                    tree_changed = true;
+                                }
+                            }
+                            if tree_changed {
+                                // Keep expansion, selection and the existing scroll handle.
+                                editor.rebuild_flattened_tree();
+                                cx.notify();
+                            }
+                        }
                         for (id, path, previous, stamp, bytes) in changes {
                             let Some(index) = editor.tabs.iter().position(|doc|
                                 doc.untitled_id == id && doc.path.as_ref() == Some(&path)) else { continue; };
