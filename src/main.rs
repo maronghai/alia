@@ -776,6 +776,7 @@ impl Editor {
         });
         let subscription = cx.subscribe_in(&input, window, |this, input, event, _, cx| {
             if matches!(event, InputEvent::Change) {
+                input.update(cx, |state, cx| state.refresh_highlighter(cx));
                 if let Some(doc) = this.tabs.iter_mut().find(|doc| doc.input == *input) {
                     *doc.minimap_cache.borrow_mut() = None;
                     let state = input.read(cx);
@@ -1564,6 +1565,7 @@ impl Editor {
                 self.bom = bom;
                 self.input.update(cx, |state, cx| {
                     state.set_value(text, window, cx);
+                    state.refresh_highlighter(cx);
                     state.focus(window, cx);
                 });
                 self.reveal_active_in_tree();

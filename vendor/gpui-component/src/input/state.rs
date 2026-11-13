@@ -515,14 +515,22 @@ impl InputState {
         new_language: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
+        let new_language = new_language.into();
         match &mut self.mode {
             InputMode::CodeEditor {
                 language,
                 highlighter,
                 ..
             } => {
-                *language = new_language.into();
+                // Saving the same language must preserve its parsed syntax tree.
+                if *language == new_language {
+                    return;
+                }
+                *language = new_language;
                 *highlighter.borrow_mut() = None;
+                // A language change does not emit InputEvent::Change. Schedule
+                // full parsing explicitly, including Save As with a new suffix.
+                self._pending_update = true;
             }
             _ => {}
         }
@@ -537,6 +545,15 @@ impl InputState {
             _ => {}
         }
         cx.notify();
+    }
+
+    /// Rebuild the syntax tree from the current complete document.
+    ///
+    /// The next render creates a fresh Tree-sitter highlighter and parses the
+    /// current Rope from scratch, which is useful after compound host edits.
+    pub fn refresh_highlighter(&mut self, cx: &mut Context<Self>) {
+        self.reset_highlighter(cx);
+        self._pending_update = true;
     }
 
     #[inline]

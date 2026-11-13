@@ -682,3 +682,32 @@ fn explorer_resize_respects_width_and_editor_space() {
     assert_eq!(super::explorer_width(600.0, 800.0), 480.0);
     assert_eq!(super::explorer_width(600.0, 400.0), 180.0);
 }
+
+#[test]
+fn syntax_styles_survive_save_and_reparse() {
+    use gpui_component::{highlighter::{HighlightTheme, SyntaxHighlighter}, input::Rope};
+    let root = std::path::PathBuf::from(std::env::var_os("FEIBO_TMP").unwrap_or_else(|| std::env::temp_dir().into_os_string()))
+        .join("save-highlight-regression");
+    std::fs::create_dir_all(&root).unwrap();
+    let theme = HighlightTheme::default_dark();
+    for (name, language, code) in [
+        ("main.rs", "rust", "fn main() { let value = 42; }\n"),
+        ("main.py", "python", "def main():\n    return 42\n"),
+        ("notes.md", "markdown", "# Heading\n\n**bold** and `code`\n"),
+    ] {
+        let mut highlighter = SyntaxHighlighter::new(language);
+        let rope = Rope::from(code);
+        highlighter.update(None, &rope);
+        let before = highlighter.styles(&(0..code.len()), &theme);
+        assert!(before.iter().any(|(_, style)| style != &Default::default()), "{language} must have non-default styles");
+        let path = root.join(name);
+        std::fs::write(&path, super::encode_text(code, true, true)).unwrap();
+        let (saved, _, _) = super::decode_text(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(super::detect_language(Some(&path)).0, language);
+        highlighter.update(None, &Rope::from(saved.as_str()));
+        assert_eq!(before, highlighter.styles(&(0..saved.len()), &theme));
+        let mut reparsed = SyntaxHighlighter::new(language);
+        reparsed.update(None, &Rope::from(saved.as_str()));
+        assert_eq!(before, reparsed.styles(&(0..saved.len()), &theme));
+    }
+}
