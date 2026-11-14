@@ -119,3 +119,6 @@ Explorer checks the root and expanded directories in the background approximatel
 ### Git decorations in Explorer
 
 Explorer checks Git status in the background with its automatic refresh. File names and right-aligned badges show M (modified), A (added), D (deleted), R (renamed), U (conflict), and ? (untracked), including staged changes. Folders summarize descendant changes, prioritizing conflicts. Deleted files appear through their remaining parent folder, not as synthetic file entries. Ignored files are not decorated. Non-repository folders have no Git badges. Git must be available on PATH; status collection failures clear the decorations.
+### Git Change Navigation
+
+The Explorer and editor show Git changes together. Added, modified, and deleted lines receive colored markers in the editor gutter, and clicking a marker moves the caret to that line. Markers refresh automatically with the repository status.

@@ -411,6 +411,81 @@ impl GitDecoration {
             Self::Modified => 3, Self::Deleted => 4, Self::Conflict => 5 }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitLineKind { Added, Modified, Deleted }
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+struct GitLineChanges {
+    added: HashSet<usize>,
+    modified: HashSet<usize>,
+    deleted_before: HashSet<usize>,
+}
+
+impl GitLineChanges {
+    fn kind_at(&self, line: usize) -> Option<GitLineKind> {
+        if self.added.contains(&line) { Some(GitLineKind::Added) }
+        else if self.modified.contains(&line) { Some(GitLineKind::Modified) }
+        else if self.deleted_before.contains(&line) { Some(GitLineKind::Deleted) }
+        else { None }
+    }
+}
+
+fn parse_git_diff_lines(diff: &str) -> GitLineChanges {
+    let mut result = GitLineChanges::default();
+    let mut new_line = 0usize;
+    let mut deleted_pending = false;
+    for line in diff.lines() {
+        if let Some(hunk) = line.strip_prefix("@@") {
+            let Some(plus) = hunk.find('+') else { continue; };
+            let range = hunk[plus + 1..].split_whitespace().next().unwrap_or("");
+            new_line = range.split(',').next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            continue;
+        }
+        if line.starts_with("+++") || line.starts_with("---") || line.starts_with('\\') || new_line == 0 { continue; }
+        if line.starts_with('+') {
+            if deleted_pending { result.modified.insert(new_line.saturating_sub(1)); }
+            else { result.added.insert(new_line.saturating_sub(1)); }
+            deleted_pending = false;
+            new_line += 1;
+        } else if line.starts_with('-') {
+            result.deleted_before.insert(new_line.saturating_sub(1));
+            deleted_pending = true;
+        } else if line.starts_with(' ') {
+            deleted_pending = false;
+            new_line += 1;
+        }
+    }
+    result
+}
+
+fn git_line_changes(path: &Path) -> GitLineChanges {
+    let Some(parent) = path.parent() else { return GitLineChanges::default(); };
+    let Some(name) = path.file_name() else { return GitLineChanges::default(); };
+    let mut command = std::process::Command::new("git");
+    command.arg("--no-optional-locks").arg("-C").arg(parent)
+        .args(["diff", "HEAD", "--unified=0", "--"]).arg(name);
+    #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
+    let output = command.output().ok().filter(|o| o.status.success());
+    if let Some(output) = output {
+        if let Ok(diff) = String::from_utf8(output.stdout) {
+            let parsed = parse_git_diff_lines(&diff);
+            if !parsed.added.is_empty() || !parsed.modified.is_empty() || !parsed.deleted_before.is_empty() {
+                return parsed;
+            }
+        }
+    }
+    let mut status = std::process::Command::new("git");
+    status.arg("-C").arg(parent).args(["status", "--porcelain=v1", "--"]).arg(name);
+    #[cfg(windows)] { use std::os::windows::process::CommandExt; status.creation_flags(0x08000000); }
+    let untracked = status.output().ok().filter(|o| o.status.success())
+        .map(|o| o.stdout.starts_with(b"??")) == Some(true);
+    if untracked {
+        let count = fs::read_to_string(path).map(|text| text.lines().count().max(1)).unwrap_or(1);
+        return GitLineChanges { added: (0..count).collect(), ..Default::default() };
+    }
+    GitLineChanges::default()
+}
+
 fn parse_git_decorations(repo: &Path, root: &Path, bytes: &[u8]) -> HashMap<PathBuf, GitDecoration> {
     let mut result = HashMap::new();
     let mut records = bytes.split(|b| *b == 0);
@@ -524,6 +599,7 @@ struct Document {
     bom: bool,
     untitled_id: usize,
     minimap_cache: RefCell<Option<Rc<Vec<Vec<(f32, f32, u32)>>>>>,
+    git_lines: GitLineChanges,
     _subscription: Subscription,
 }
 
@@ -900,6 +976,7 @@ impl Editor {
             bom: false,
             untitled_id,
             minimap_cache: RefCell::new(None),
+            git_lines: GitLineChanges::default(),
             _subscription: subscription,
         }
     }
@@ -969,11 +1046,11 @@ impl Editor {
                         if previous.as_ref() == Some(&entries) { return None; }
                         Some((path, previous, entries))
                     }).collect::<Vec<_>>();
-                    let changes = requests.into_iter().filter_map(|(id, path, previous)| {
+                    let changes = requests.into_iter().map(|(id, path, previous)| {
                         let stamp = disk_stamp(&path);
-                        if stamp == previous { return None; }
-                        let bytes = fs::read(&path);
-                        Some((id, path, previous, stamp, bytes))
+                        let bytes = if stamp != previous { fs::read(&path).ok() } else { None };
+                        let git_lines = git_line_changes(&path);
+                        (id, path, previous, stamp, bytes, git_lines)
                     }).collect::<Vec<_>>();
                     (changes, directory_changes, git_status)
                 }).await;
@@ -998,21 +1075,22 @@ impl Editor {
                                 cx.notify();
                             }
                         }
-                        for (id, path, previous, stamp, bytes) in changes {
+                        for (id, path, previous, stamp, bytes, git_lines) in changes {
                             let Some(index) = editor.tabs.iter().position(|doc|
                                 doc.untitled_id == id && doc.path.as_ref() == Some(&path)) else { continue; };
                             let doc = &mut editor.tabs[index];
+                            if doc.git_lines != git_lines {
+                                doc.git_lines = git_lines;
+                                cx.notify();
+                            }
                             // A save/open may have completed while the background read was in flight.
                             if doc.disk_stamp != previous { continue; }
                             doc.disk_stamp = stamp;
-                            let bytes = match bytes {
-                                Ok(bytes) => bytes,
-                                Err(_) => {
+                            let Some(bytes) = bytes else {
+                                continue;
+                            };
                                     editor.message = format!("File removed or unavailable: {} — local content kept", path.display());
                                     cx.notify();
-                                    continue;
-                                }
-                            };
                             match external_change(&doc.saved_text, doc.crlf, doc.bom,
                                 !text_matches_saved(doc.input.read(cx), &doc.saved_text), &bytes) {
                                 ExternalChange::Unchanged => {},
@@ -1171,7 +1249,8 @@ impl Editor {
             return false;
         }
         self.disk_stamp = disk_stamp(&path);
-        self.path = Some(path);
+        self.path = Some(path.clone());
+        self.git_lines = git_line_changes(&path);
         self.update_language(cx);
         self.saved_text = text;
         self.dirty_cached = false;
@@ -1817,7 +1896,8 @@ impl Editor {
                     self.new_file(&NewFile, window, cx);
                 }
                 self.disk_stamp = disk_stamp(&path);
-                self.path = Some(path);
+                self.path = Some(path.clone());
+                self.git_lines = git_line_changes(&path);
                 self.update_language(cx);
                 self.lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
                 self.chars = text.chars().count();
@@ -2770,6 +2850,41 @@ fn toggle_column_mode(&mut self, _: &ToggleColumnMode, window: &mut Window, cx: 
         false
     }
 
+    fn git_change_gutter(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let changes = self.git_lines.clone();
+        let input = self.input.clone();
+        let total_lines = self.lines;
+        div().id("git-change-gutter").absolute().left_0().top_0().bottom_0().w(px(5.))
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                let bounds = this.input.read(cx).column_caret_bounds(0, total_lines.saturating_sub(1), 0, 0);
+                let y = f32::from(event.position.y);
+                let target = bounds.iter().min_by(|(_, a, _), (_, b, _)| {
+                    let ay = (f32::from(a.origin.y) - y).abs();
+                    let by = (f32::from(b.origin.y) - y).abs();
+                    ay.partial_cmp(&by).unwrap_or(std::cmp::Ordering::Equal)
+                }).map(|(line, _, _)| *line).unwrap_or(0);
+                this.input.update(cx, |state, cx| {
+                    state.set_cursor_position(Position { line: target as u32, character: 0 }, window, cx);
+                    state.focus(window, cx);
+                });
+                cx.notify();
+            }))
+            .child(canvas(move |_, _, _| {}, move |bounds, _, window, cx| {
+                let row_bounds = input.read(cx).column_caret_bounds(0, total_lines.saturating_sub(1), 0, 0);
+                for (line, caret, _) in row_bounds {
+                    let color = match changes.kind_at(line) {
+                        Some(GitLineKind::Added) => 0x73c991,
+                        Some(GitLineKind::Modified) => 0xe2c08d,
+                        Some(GitLineKind::Deleted) => 0xf48771,
+                        None => continue,
+                    };
+                    let origin = point(bounds.origin.x, caret.origin.y);
+                    window.paint_quad(fill(Bounds::new(origin, size(px(4.), caret.size.height)), rgb(color)));
+                }
+            }).size_full())
+    }
+
     fn column_cursors_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let input = self.input.clone();
         let first = self.column_start_line.min(self.column_end_line);
@@ -3107,6 +3222,7 @@ impl Render for Editor {
                                                     .font_family("Cascadia Code")
                                                     .text_size(px(16.)),
                                             )
+                                            .child(self.git_change_gutter(cx))
                                             .children(self.column_mode.then(|| self.column_cursors_overlay(cx))),
                                     )
                                     .children(self.minimap_visible.then(|| self.minimap_panel(cx))),

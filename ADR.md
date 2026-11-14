@@ -546,3 +546,6 @@ GPUI 0.2.2 panics when hover() is assigned twice to one element. Toolbar variant
 ### Tab context menu dismissal
 
 The deferred anchored layer uses an explicit window origin and window dimensions. Its occluding backdrop consumes outside mouse presses before dismissing the menu. Escape is captured as both a key event and the bound ColumnEscape action so focused Input actions cannot keep the menu open or inadvertently exit column mode. Opening a Tab context menu clears the Open menu. Desktop interaction verification remains required.
+## ADR-018: Editor Git Change Gutter
+
+The editor derives line ranges from `git diff HEAD --unified=0` and renders them in a narrow gutter using the input component's measured line bounds. The gutter is layered above the editor for click-to-line navigation, while column editing continues to use the input component's native caret bounds. Git status polling updates the per-document cache without reloading document text.
