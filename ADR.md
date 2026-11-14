@@ -541,3 +541,8 @@ Use background git --no-optional-locks status --porcelain=v1 -z --untracked-file
 ### Startup crash: duplicate hover style
 
 GPUI 0.2.2 panics when hover() is assigned twice to one element. Toolbar variants now build on tool_base(), which only defines layout; each variant assigns its hover style once. The previous toolbar prevented the first window from rendering.
+
+
+### Tab context menu dismissal
+
+The deferred anchored layer uses an explicit window origin and window dimensions. Its occluding backdrop consumes outside mouse presses before dismissing the menu. Escape is captured as both a key event and the bound ColumnEscape action so focused Input actions cannot keep the menu open or inadvertently exit column mode. Opening a Tab context menu clears the Open menu. Desktop interaction verification remains required.

@@ -1271,6 +1271,7 @@ impl Editor {
     ) {
         if index < self.tabs.len() {
             self.switch_tab(index, window, cx);
+            self.open_menu_position = None;
             self.tab_context_menu = Some(TabContextMenu {
                 tab_index: index,
                 position,
@@ -1665,25 +1666,27 @@ impl Editor {
         };
 
         deferred(
-            anchored().child(
+            anchored().position(point(px(0.), px(0.))).child(
                 div()
                     .id("context-menu-layer")
-                    .absolute()
-                    .size_full()
-                    .top_0()
-                    .left_0()
+                    .relative()
+                    .w(window_size.width)
+                    .h(window_size.height)
                     .child(
                         div()
                             .id("context-menu-backdrop")
+                            .occlude()
                             .size_full()
                             .absolute()
                             .top_0()
                             .left_0()
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
                                 this.tab_context_menu = None;
                                 cx.notify();
                             }))
                             .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
                                 this.tab_context_menu = None;
                                 cx.notify();
                             })),
@@ -2843,7 +2846,19 @@ impl Render for Editor {
             }))
             //
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && this.open_menu_position.take().is_some() {
+                if event.keystroke.key == "escape"
+                    && (this.open_menu_position.is_some() || this.tab_context_menu.is_some())
+                {
+                    this.open_menu_position = None;
+                    this.tab_context_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &ColumnEscape, _, cx| {
+                if this.open_menu_position.is_some() || this.tab_context_menu.is_some() {
+                    this.open_menu_position = None;
+                    this.tab_context_menu = None;
                     cx.stop_propagation();
                     cx.notify();
                 }
