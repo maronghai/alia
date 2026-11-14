@@ -552,3 +552,7 @@ The editor derives line ranges from `git diff HEAD --unified=0` and renders them
 
 ## 大文件打开性能策略
 读盘、解码、性能策略判断和首次统计放在后台任务；完成后在 UI 线程创建文档，重复请求按路径合并。达到 1 MiB、20,000 行或 16,384 字节单行时进入轻量模式，禁用语法解析、Minimap 与折行；纯文本在组件中跳过解析器。Git 行扫描对 1 MiB 以上文件返回空标记。保留完整正文、保存及现有列光标定位。首次 Rope/组件排版仍在 UI 线程，未承诺无延迟。
+
+## Hard-tab rendering correction
+
+Hard tabs are rendered at four-column tab stops in the input layout layer. Display shaping replaces each tab with one blank glyph and shifts subsequent glyphs to the next stop, retaining original UTF-8 byte indices and source text. The same layout is used for text width; wrapping maps expanded whitespace boundaries back to source bytes. Saving does not convert tabs to spaces. Column caret coordinate calibration is unchanged. Validation: 48 application tests passed, including tab stops and Unicode byte mapping; desktop visual verification remains pending.

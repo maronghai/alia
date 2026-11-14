@@ -810,3 +810,7 @@ The deferred anchored layer uses an explicit window origin and window dimensions
 
 ## 大文件的初始化预算
 不要在 GPUI 事件回调中同步读盘、解码及调用 git diff。使用 background_executor 生成结果，再经 spawn_in 的窗口上下文提交。纯文本模式应在组件解析入口跳过 Tree-sitter，而非仅更改语言标签。限制超长行折行与全文 Minimap 缓存；首次文本组件布局仍需测量，不能以编译通过宣称性能达标。
+
+## Hard tabs: keep source offsets independent of display width
+
+Do not replace tabs in the document merely to make them visible. Shape display whitespace while retaining original byte indices, expand its advance to the next tab stop, and use matching measurements for wrapping, caret hit testing and horizontal extent. Tab regression tests must cover tabs at column zero and at a stop boundary, consecutive tabs, Unicode text and unchanged source bytes. In this correction 48 tests passed; the new regression checks arithmetic and byte mapping rather than desktop pixels.

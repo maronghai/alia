@@ -146,9 +146,16 @@ impl TextWrapper {
             range,
             new_text,
             &mut |line_str, wrap_width| {
-                line_wrapper
-                    .wrap_line(&[LineFragment::text(line_str)], wrap_width)
-                    .collect()
+                if !line_str.contains('\t') {
+                    return line_wrapper.wrap_line(&[LineFragment::text(line_str)], wrap_width).collect();
+                }
+                let (display, map) = super::tab_layout::wrap_text(line_str);
+                let mut boundaries: Vec<_> = line_wrapper
+                    .wrap_line(&[LineFragment::text(&display)], wrap_width).collect();
+                for boundary in &mut boundaries { boundary.ix = map[boundary.ix.min(map.len() - 1)]; }
+                boundaries.retain(|boundary| boundary.ix > 0);
+                boundaries.dedup_by_key(|boundary| boundary.ix);
+                boundaries
             },
         );
     }

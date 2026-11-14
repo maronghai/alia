@@ -594,11 +594,35 @@ const LARGE_FILE_BYTES: usize = 1024 * 1024;
 const LARGE_FILE_LINES: usize = 20_000;
 const LARGE_LINE_BYTES: usize = 16_384;
 
-fn large_file_mode(text: &str) -> bool {
-    text.len() >= LARGE_FILE_BYTES
-        || text.lines().take(LARGE_FILE_LINES).count() >= LARGE_FILE_LINES
-        || text.split('\n').any(|line| line.len() >= LARGE_LINE_BYTES)
+/// Compute the expensive document metrics in one UTF-8 pass on the background thread.
+/// Keeping this together avoids repeatedly scanning a large buffer before the first frame.
+fn analyze_text(text: &str) -> (bool, usize, usize) {
+    let mut lines = 1usize;
+    let mut chars = 0usize;
+    let mut current_line_bytes = 0usize;
+    let mut max_line_bytes = 0usize;
+    for ch in text.chars() {
+        chars += 1;
+        let width = ch.len_utf8();
+        if ch == '\n' {
+            max_line_bytes = max_line_bytes.max(current_line_bytes);
+            current_line_bytes = 0;
+            lines += 1;
+        } else {
+            current_line_bytes += width;
+        }
+    }
+    max_line_bytes = max_line_bytes.max(current_line_bytes);
+    let large = text.len() >= LARGE_FILE_BYTES
+        || lines >= LARGE_FILE_LINES
+        || max_line_bytes >= LARGE_LINE_BYTES;
+    (large, lines, chars)
 }
+
+fn large_file_mode(text: &str) -> bool {
+    analyze_text(text).0
+}
+
 
 struct Document {
     input: Entity<InputState>,
@@ -1914,9 +1938,7 @@ impl Editor {
                 fs::read(&read_path).map_err(|e| e.to_string())
                     .and_then(|bytes| decode_text(&bytes))
                     .map(|(text, crlf, bom)| {
-                        let large = large_file_mode(&text);
-                        let lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
-                        let chars = text.chars().count();
+                        let (large, lines, chars) = analyze_text(&text);
                         (text, crlf, bom, large, lines, chars)
                     })
             }).await;
@@ -1944,7 +1966,9 @@ impl Editor {
                 self.path = Some(path.clone());
                 self.large_file = large;
                 self.git_lines = GitLineChanges::default();
-                self.update_language(cx);
+                if !large {
+                    self.update_language(cx);
+                }
                 self.lines = lines;
                 self.chars = chars;
                 self.input.update(cx, |state, cx| state.set_soft_wrap(!large, window, cx));
@@ -1954,7 +1978,9 @@ impl Editor {
                 self.bom = bom;
                 self.input.update(cx, |state, cx| {
                     state.set_value(text, window, cx);
-                    state.refresh_highlighter(cx);
+                    if !large {
+                        state.refresh_highlighter(cx);
+                    }
                     state.focus(window, cx);
                 });
                 self.reveal_active_in_tree();

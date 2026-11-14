@@ -715,9 +715,7 @@ impl TextElement {
                 };
 
                 let sub_line: SharedString = line[range.clone()].to_string().into();
-                let shaped_line = window
-                    .text_system()
-                    .shape_line(sub_line, font_size, &line_runs, None);
+                let shaped_line = super::tab_layout::shape_line(sub_line, font_size, &line_runs, window);
 
                 wrapped_lines.push(shaped_line);
             }
@@ -1077,9 +1075,7 @@ impl Element for TextElement {
         if state.mode.is_single_line() || !state.soft_wrap {
             let longest_row = state.text_wrapper.longest_row.row;
             let longest_line: SharedString = state.text.slice_line(longest_row).to_string().into();
-            longest_line_width = window
-                .text_system()
-                .shape_line(
+            longest_line_width = super::tab_layout::shape_line(
                     longest_line.clone(),
                     text_size,
                     &[TextRun {
@@ -1090,7 +1086,7 @@ impl Element for TextElement {
                         underline: None,
                         strikethrough: None,
                     }],
-                    wrap_width,
+                    window,
                 )
                 .width;
         }

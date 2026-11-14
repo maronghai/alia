@@ -799,3 +799,18 @@ fn large_file_policy_covers_bytes_lines_and_long_lines() {
     assert!(large_file_mode(&"x".repeat(LARGE_LINE_BYTES)));
     assert!(!large_file_mode(&"x".repeat(LARGE_LINE_BYTES - 1)));
 }
+
+#[path = "../vendor/gpui-component/src/input/tab_layout.rs"]
+mod tab_layout_regression;
+
+#[test]
+fn hard_tabs_preserve_source_indices_and_tab_stops() {
+    use tab_layout_regression::{wrap_text, tab_advance};
+    let (display, map) = wrap_text("a\t中\tZ");
+    assert_eq!(display, "a   中   Z");
+    assert_eq!(map[4], 2);
+    assert_eq!(*map.last().unwrap(), "a\t中\tZ".len());
+    assert_eq!(tab_advance(0.0, 32.0), 32.0);
+    assert_eq!(tab_advance(8.0, 32.0), 24.0);
+    assert_eq!(tab_advance(32.0, 32.0), 32.0);
+}
