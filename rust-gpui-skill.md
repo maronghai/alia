@@ -807,3 +807,6 @@ The deferred anchored layer uses an explicit window origin and window dimensions
 ## 18. Git 行级标记与 GPUI 编辑区定位
 
 编辑区的 Git 标记应复用 InputState 提供的真实行边界，不要自行估算行高或滚动偏移。将标记栏作为绝对定位的窄层放在 Input 上方，点击时按同一组行边界定位光标。Git 状态轮询只更新行标记缓存，文件内容变化才进入外部文件同步流程。
+
+## 大文件的初始化预算
+不要在 GPUI 事件回调中同步读盘、解码及调用 git diff。使用 background_executor 生成结果，再经 spawn_in 的窗口上下文提交。纯文本模式应在组件解析入口跳过 Tree-sitter，而非仅更改语言标签。限制超长行折行与全文 Minimap 缓存；首次文本组件布局仍需测量，不能以编译通过宣称性能达标。

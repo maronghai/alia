@@ -789,3 +789,13 @@ fn git_decorations_scope_unicode_and_clean_snapshots() {
     assert!(!states.contains_key(&repo.join("other")));
     assert!(parse_git_decorations(repo, &root, b"").is_empty());
 }
+
+#[test]
+fn large_file_policy_covers_bytes_lines_and_long_lines() {
+    use super::{large_file_mode, LARGE_FILE_BYTES, LARGE_FILE_LINES, LARGE_LINE_BYTES};
+    assert!(!large_file_mode("fn main() { println!(\"hello\"); }\n"));
+    assert!(large_file_mode(&"x\n".repeat(LARGE_FILE_BYTES / 2)));
+    assert!(large_file_mode(&"x\n".repeat(LARGE_FILE_LINES)));
+    assert!(large_file_mode(&"x".repeat(LARGE_LINE_BYTES)));
+    assert!(!large_file_mode(&"x".repeat(LARGE_LINE_BYTES - 1)));
+}

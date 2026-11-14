@@ -459,6 +459,9 @@ fn parse_git_diff_lines(diff: &str) -> GitLineChanges {
 }
 
 fn git_line_changes(path: &Path) -> GitLineChanges {
+    if fs::metadata(path).map(|m| m.len() >= LARGE_FILE_BYTES as u64).unwrap_or(false) {
+        return GitLineChanges::default();
+    }
     let Some(parent) = path.parent() else { return GitLineChanges::default(); };
     let Some(name) = path.file_name() else { return GitLineChanges::default(); };
     let mut command = std::process::Command::new("git");
@@ -587,10 +590,21 @@ fn external_change(saved: &str, crlf: bool, bom: bool, dirty: bool, bytes: &[u8]
     else { ExternalChange::Reload }
 }
 
+const LARGE_FILE_BYTES: usize = 1024 * 1024;
+const LARGE_FILE_LINES: usize = 20_000;
+const LARGE_LINE_BYTES: usize = 16_384;
+
+fn large_file_mode(text: &str) -> bool {
+    text.len() >= LARGE_FILE_BYTES
+        || text.lines().take(LARGE_FILE_LINES).count() >= LARGE_FILE_LINES
+        || text.split('\n').any(|line| line.len() >= LARGE_LINE_BYTES)
+}
+
 struct Document {
     input: Entity<InputState>,
     path: Option<PathBuf>,
     saved_text: String,
+    large_file: bool,
     disk_stamp: Option<DiskStamp>,
     dirty_cached: bool,
     lines: usize,
@@ -953,7 +967,9 @@ impl Editor {
         });
         let subscription = cx.subscribe_in(&input, window, |this, input, event, _, cx| {
             if matches!(event, InputEvent::Change) {
-                input.update(cx, |state, cx| state.refresh_highlighter(cx));
+                if !this.tabs.iter().any(|doc| doc.input == *input && doc.large_file) {
+                    input.update(cx, |state, cx| state.refresh_highlighter(cx));
+                }
                 if let Some(doc) = this.tabs.iter_mut().find(|doc| doc.input == *input) {
                     *doc.minimap_cache.borrow_mut() = None;
                     let state = input.read(cx);
@@ -968,6 +984,7 @@ impl Editor {
             input,
             path: None,
             saved_text: String::new(),
+            large_file: false,
             disk_stamp: None,
             dirty_cached: false,
             lines: 1,
@@ -1103,12 +1120,16 @@ impl Editor {
                                         let cursor = doc.input.read(cx).cursor_position();
                                         doc.lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
                                         doc.chars = text.chars().count();
+                                        doc.large_file = large_file_mode(&text);
                                         doc.saved_text = text.clone();
                                         doc.crlf = crlf;
                                         doc.bom = bom;
                                         doc.dirty_cached = false;
                                         *doc.minimap_cache.borrow_mut() = None;
+                                        let language = if doc.large_file { "text" } else { detect_language(Some(&path)).0 };
                                         doc.input.update(cx, |state, cx| {
+                                            state.set_highlighter(language, cx);
+                                            state.set_soft_wrap(!doc.large_file, window, cx);
                                             state.set_value(text, window, cx);
                                             state.set_cursor_position(cursor, window, cx);
                                             state.refresh_highlighter(cx);
@@ -1157,7 +1178,7 @@ impl Editor {
     }
 
     fn update_language(&mut self, cx: &mut Context<Self>) {
-        let language = detect_language(self.path.as_deref()).0;
+        let language = if self.large_file { "text" } else { detect_language(self.path.as_deref()).0 };
         self.input
             .update(cx, |state, cx| state.set_highlighter(language, cx));
     }
@@ -1885,11 +1906,35 @@ impl Editor {
             self.switch_tab(index, window, cx);
             return;
         }
-        let decoded = fs::read(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| decode_text(&bytes));
+        self.message = format!("Opening {}...", path.display());
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let read_path = path.clone();
+            let decoded = cx.background_executor().spawn(async move {
+                fs::read(&read_path).map_err(|e| e.to_string())
+                    .and_then(|bytes| decode_text(&bytes))
+                    .map(|(text, crlf, bom)| {
+                        let large = large_file_mode(&text);
+                        let lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
+                        let chars = text.chars().count();
+                        (text, crlf, bom, large, lines, chars)
+                    })
+            }).await;
+            let _ = cx.update(|window, cx| {
+                let _ = view.update(cx, |editor, cx| editor.finish_open_path(path, decoded, window, cx));
+            });
+        }).detach();
+    }
+
+    fn finish_open_path(&mut self, path: PathBuf,
+        decoded: Result<(String, bool, bool, bool, usize, usize), String>,
+        window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.tabs.iter().position(|doc| doc.path.as_ref() == Some(&path)) {
+            self.switch_tab(index, window, cx);
+            return;
+        }
         match decoded {
-            Ok((text, crlf, bom)) => {
+            Ok((text, crlf, bom, large, lines, chars)) => {
                 let reuse_blank =
                     self.path.is_none() && self.saved_text.is_empty() && self.text(cx).is_empty();
                 if !reuse_blank {
@@ -1897,10 +1942,12 @@ impl Editor {
                 }
                 self.disk_stamp = disk_stamp(&path);
                 self.path = Some(path.clone());
-                self.git_lines = git_line_changes(&path);
+                self.large_file = large;
+                self.git_lines = GitLineChanges::default();
                 self.update_language(cx);
-                self.lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
-                self.chars = text.chars().count();
+                self.lines = lines;
+                self.chars = chars;
+                self.input.update(cx, |state, cx| state.set_soft_wrap(!large, window, cx));
                 self.dirty_cached = false;
                 self.saved_text = text.clone();
                 self.crlf = crlf;
@@ -1911,7 +1958,7 @@ impl Editor {
                     state.focus(window, cx);
                 });
                 self.reveal_active_in_tree();
-                self.message = "File opened".into();
+                self.message = if large { "Large file mode: syntax, minimap and Git line markers paused" } else { "File opened" }.into();
                 cx.notify();
             }
             Err(err) => self.error(format!("Cannot open file {}: {err}", path.display()), cx),
@@ -3225,7 +3272,7 @@ impl Render for Editor {
                                             .child(self.git_change_gutter(cx))
                                             .children(self.column_mode.then(|| self.column_cursors_overlay(cx))),
                                     )
-                                    .children(self.minimap_visible.then(|| self.minimap_panel(cx))),
+                                    .children((self.minimap_visible && !self.large_file).then(|| self.minimap_panel(cx))),
                             ),
                     ),
             )
@@ -3281,7 +3328,7 @@ impl Render for Editor {
                                     .px_1p5()
                                     .py_0p5()
                                     .text_color(rgb(0xa5b4fc))
-                                    .child(detect_language(self.path.as_deref()).1),
+                                    .child(if self.large_file { "Large file mode" } else { detect_language(self.path.as_deref()).1 }),
                             )
                             .child(
                                 div()

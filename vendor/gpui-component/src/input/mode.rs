@@ -202,6 +202,11 @@ impl InputMode {
                 highlighter,
                 ..
             } => {
+                // Plain text has no syntax captures: skip parser creation and full parsing.
+                if language.as_ref() == "text" {
+                    highlighter.borrow_mut().take();
+                    return;
+                }
                 if !force && highlighter.borrow().is_some() {
                     return;
                 }

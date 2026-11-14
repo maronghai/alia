@@ -122,3 +122,6 @@ Explorer checks Git status in the background with its automatic refresh. File na
 ### Git Change Navigation
 
 The Explorer and editor show Git changes together. Added, modified, and deleted lines receive colored markers in the editor gutter, and clicking a marker moves the caret to that line. Markers refresh automatically with the repository status.
+
+### Large files
+Files of at least 1 MiB, 20,000 lines, or a line of at least 16,384 bytes open in Large file mode. Reading, decoding and initial counts run in the background. Syntax parsing, minimap and soft wrapping are disabled for these documents; Git line scans are skipped for files of at least 1 MiB. The full text remains editable and saveable. Initial widget text layout can still take time; this is not a streaming editor.
