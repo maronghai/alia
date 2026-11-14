@@ -785,3 +785,17 @@ let y = content_top + row as f32 * line_height - column_scroll_y;
 ### Menu command dispatch: cancel must not reopen a dialog
 
 Context-menu items consume mouse-down without executing commands and invoke the command only on click. Binding the command to both mouse-down and click opened two native dialogs in sequence, including after Cancel. This applies to Open File, Open Folder, and tab context-menu commands.
+
+
+### Compact grouped toolbar
+
+The 48px toolbar separates file commands on the left from view and column-mode toggles on the right. Open uses a muted blue accent; other commands use lightweight hover surfaces. Toggle dots indicate state without changing label widths. Existing keyboard shortcuts and command dispatch are retained.
+
+## Git 状态与 GPUI 虚拟文件树
+
+Git 状态进程应放到后台执行器；使用 porcelain v1 -z 避免空格、中文和换行路径的引用歧义，重命名记录需要额外消费源路径。缓存文件和祖先目录状态，UI 只做 HashMap 查询，避免渲染中调用 Git。异步结果应用前检查根目录，目录切换清理旧标记。Windows 使用 CREATE_NO_WINDOW 避免每次刷新闪现控制台。
+
+
+### Startup crash: duplicate hover style
+
+GPUI 0.2.2 panics when hover() is assigned twice to one element. Toolbar variants now build on tool_base(), which only defines layout; each variant assigns its hover style once. The previous toolbar prevented the first window from rendering.

@@ -394,6 +394,74 @@ struct TreeEntry {
     directory: bool,
 }
 
+// Cached Git decorations. Git and filesystem access run only on the background executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitDecoration { Untracked, Added, Modified, Renamed, Deleted, Conflict }
+impl GitDecoration {
+    fn label(self) -> &'static str {
+        match self { Self::Untracked => "?", Self::Added => "A", Self::Modified => "M",
+            Self::Renamed => "R", Self::Deleted => "D", Self::Conflict => "U" }
+    }
+    fn color(self) -> u32 {
+        match self { Self::Untracked | Self::Added => 0x73c991, Self::Modified => 0xe2c08d,
+            Self::Renamed => 0x73b8ef, Self::Deleted => 0xf48771, Self::Conflict => 0xff6b81 }
+    }
+    fn priority(self) -> u8 {
+        match self { Self::Untracked => 0, Self::Added => 1, Self::Renamed => 2,
+            Self::Modified => 3, Self::Deleted => 4, Self::Conflict => 5 }
+    }
+}
+fn parse_git_decorations(repo: &Path, root: &Path, bytes: &[u8]) -> HashMap<PathBuf, GitDecoration> {
+    let mut result = HashMap::new();
+    let mut records = bytes.split(|b| *b == 0);
+    while let Some(record) = records.next() {
+        if record.len() < 4 { continue; }
+        let x = record[0]; let y = record[1];
+        // In porcelain v1 -z, rename/copy records contain destination then source.
+        if x == b'R' || y == b'R' || x == b'C' || y == b'C' { let _ = records.next(); }
+        let status = if x == b'U' || y == b'U' || (x == b'A' && y == b'A') || (x == b'D' && y == b'D') {
+            GitDecoration::Conflict
+        } else if x == b'?' && y == b'?' { GitDecoration::Untracked
+        } else if x == b'D' || y == b'D' { GitDecoration::Deleted
+        } else if x == b'R' || y == b'R' { GitDecoration::Renamed
+        } else if x == b'A' || y == b'A' { GitDecoration::Added
+        } else { GitDecoration::Modified };
+        let Ok(name) = std::str::from_utf8(&record[3..]) else { continue; };
+        let path = repo.join(name);
+        if !path.starts_with(root) { continue; }
+        let mut current = Some(path.as_path());
+        while let Some(path) = current {
+            if !path.starts_with(root) { break; }
+            result.entry(path.to_path_buf()).and_modify(|old: &mut GitDecoration| {
+                if status.priority() > old.priority() { *old = status; }
+            }).or_insert(status);
+            current = path.parent();
+        }
+    }
+    result
+}
+fn git_decorations(root: &Path) -> HashMap<PathBuf, GitDecoration> {
+    fn git(root: &Path, args: &[&std::ffi::OsStr]) -> Option<Vec<u8>> {
+        let mut command = std::process::Command::new("git");
+        command.arg("--no-optional-locks").arg("-C").arg(root).args(args);
+        #[cfg(windows)] {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let output = command.output().ok()?;
+        output.status.success().then_some(output.stdout)
+    }
+    let Some(top) = git(root, &[std::ffi::OsStr::new("rev-parse"), std::ffi::OsStr::new("--show-toplevel")]) else { return HashMap::new(); };
+    let Ok(top) = std::str::from_utf8(&top) else { return HashMap::new(); };
+    let repo = normalized_path(Path::new(top.trim_end_matches(['\r', '\n'])));
+    let Some(output) = git(&repo, &[
+        std::ffi::OsStr::new("status"), std::ffi::OsStr::new("--porcelain=v1"),
+        std::ffi::OsStr::new("-z"), std::ffi::OsStr::new("--untracked-files=all"),
+        std::ffi::OsStr::new("--"), root.as_os_str(),
+    ]) else { return HashMap::new(); };
+    parse_git_decorations(&repo, root, &output)
+}
+
 fn read_directory(path: &Path) -> Result<Vec<TreeEntry>, String> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
@@ -674,6 +742,7 @@ struct Editor {
     next_untitled_id: usize,
     tree_root: Option<PathBuf>,
     tree_cache: HashMap<PathBuf, Vec<TreeEntry>>,
+    git_decorations: HashMap<PathBuf, GitDecoration>,
     expanded: HashSet<PathBuf>,
     tree_visible: bool,
     tree_width: f32,
@@ -853,6 +922,7 @@ impl Editor {
             next_untitled_id: 2,
             tree_root,
             tree_cache,
+            git_decorations: HashMap::new(),
             expanded: HashSet::new(),
             tree_visible: true,
             tree_width: EXPLORER_DEFAULT_WIDTH,
@@ -891,7 +961,9 @@ impl Editor {
                         (doc.untitled_id, path, doc.disk_stamp.clone()))).collect::<Vec<_>>();
                     (requests, editor.tree_root.clone(), directories)
                 }) else { break; };
-                let (changes, directory_changes) = cx.background_executor().spawn(async move {
+                let git_root = tree_root.clone();
+                let (changes, directory_changes, git_status) = cx.background_executor().spawn(async move {
+                    let git_status = git_root.as_deref().map(git_decorations).unwrap_or_default();
                     let directory_changes = directories.into_iter().filter_map(|(path, previous)| {
                         let entries = directory_snapshot(&path)?;
                         if previous.as_ref() == Some(&entries) { return None; }
@@ -903,11 +975,15 @@ impl Editor {
                         let bytes = fs::read(&path);
                         Some((id, path, previous, stamp, bytes))
                     }).collect::<Vec<_>>();
-                    (changes, directory_changes)
+                    (changes, directory_changes, git_status)
                 }).await;
                 if cx.update(|window, cx| {
                     let _ = view.update(cx, |editor, cx| {
                         if editor.tree_root == tree_root {
+                            if editor.git_decorations != git_status {
+                                editor.git_decorations = git_status;
+                                cx.notify();
+                            }
                             let mut tree_changed = false;
                             for (path, previous, entries) in directory_changes {
                                 if (editor.tree_root.as_ref() == Some(&path) || editor.expanded.contains(&path))
@@ -1774,6 +1850,7 @@ impl Editor {
                 Ok(entries) => {
                     let root = normalized_path(&root);
                     self.tree_cache.clear();
+                    self.git_decorations.clear();
                     self.expanded.clear();
                     if let Ok(entries) = read_directory(&root) {
                         self.tree_cache.insert(root.clone(), entries);
@@ -1954,6 +2031,7 @@ impl Editor {
                                     let Some(entry) = this.flattened_tree.get(index) else {
                                         continue;
                                     };
+                                    let decoration = this.git_decorations.get(&entry.path).copied();
                                     let active = this.path.as_ref() == Some(&entry.path);
                                     let is_dir = entry.directory;
                                     let expanded = entry.expanded;
@@ -1972,7 +2050,7 @@ impl Editor {
                                             .cursor_pointer()
                                             .overflow_hidden()
                                             .bg(rgb(if active { 0x232a3b } else { 0x151821 }))
-                                            .text_color(rgb(if active { 0xf8fafc } else { 0xcbd5e1 }))
+                                            .text_color(rgb(decoration.map(|status| status.color()).unwrap_or(if active { 0xf8fafc } else { 0xcbd5e1 })))
                                             .hover(|style| style.bg(rgb(0x1c202c)))
                                             .border_l_2()
                                             .border_color(rgb(if active { 0x3b82f6 } else { 0x151821 }))
@@ -1981,11 +2059,14 @@ impl Editor {
                                                     .flex()
                                                     .items_center()
                                                     .gap_1p5()
+                                                    .flex_1().min_w_0()
                                                     .overflow_hidden()
                                                     .child(div().text_xs().text_color(rgb(0x94a3b8)).child(prefix))
                                                     .child(div().text_sm().text_color(rgb(icon_color)).child(icon))
                                                     .child(div().overflow_hidden().text_ellipsis().child(entry.name.clone())),
                                             )
+                                            .children(decoration.map(|status| div().flex_shrink_0().ml_2()
+                                                .text_xs().text_color(rgb(status.color())).child(status.label())))
                                             .on_click(cx.listener(move |this, _, w, cx| {
                                                 if is_dir {
                                                     this.toggle_folder(&entry_path, cx);
@@ -2241,36 +2322,38 @@ fn encode_text(text: &str, crlf: bool, bom: bool) -> Vec<u8> {
 
 
 fn tool_active(id: &'static str, label: &'static str, active: bool) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_3()
-        .py_2()
-        .rounded_md()
-        .cursor_pointer()
-        .bg(if active { rgb(0x1d4ed8) } else { rgb(0x1f232e) })
-        .border_1()
-        .border_color(if active { rgb(0x3b82f6) } else { rgb(0x2d3445) })
-        .hover(move |style| style.bg(if active { rgb(0x2563eb) } else { rgb(0x2a3040) }))
-        .text_color(if active { rgb(0xffffff) } else { rgb(0xd1d5db) })
-        .font_weight(if active { FontWeight::BOLD } else { FontWeight::NORMAL })
-        .text_sm()
-        .child(label)
+    tool_base(id, label)
+        .bg(if active { rgb(0x213347) } else { rgb(0x181b23) })
+        .text_color(if active { rgb(0x93c5fd) } else { rgb(0x8b95a7) })
+        .hover(move |style| style.bg(if active { rgb(0x2a4059) } else { rgb(0x252b36) }))
+        .child(div().w(px(4.)).h(px(4.)).rounded_full()
+            .bg(if active { rgb(0x60a5fa) } else { rgb(0x465063) }))
 }
 
 fn tool(id: &'static str, label: &'static str) -> Stateful<Div> {
+    tool_base(id, label)
+        .hover(|style| style.bg(rgb(0x252b36)).text_color(rgb(0xf1f5f9)))
+}
+
+fn tool_base(id: &'static str, label: &'static str) -> Stateful<Div> {
     div()
         .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .h(px(28.))
         .px_3()
-        .py_2()
+        .flex_shrink_0()
         .rounded_md()
         .cursor_pointer()
-        .bg(rgb(0x1f232e))
-        .border_1()
-        .border_color(rgb(0x2d3445))
-        .hover(|style| style.bg(rgb(0x2a3040)))
-        .text_color(rgb(0xd1d5db))
-        .text_sm()
+        .text_color(rgb(0xb5bfce))
+        .text_size(px(12.))
         .child(label)
+}
+
+fn toolbar_separator() -> Div {
+    div().w(px(1.)).h(px(16.)).mx_2().flex_shrink_0().bg(rgb(0x303642))
 }
 
 
@@ -2792,67 +2875,56 @@ impl Render for Editor {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .p_3()
+                    .gap_1()
+                    .h(px(48.))
+                    .px_4()
+                    .flex_shrink_0()
+                    .bg(rgb(0x181b23))
                     .border_b_1()
-                    .border_color(rgb(0x303b50))
+                    .border_color(rgb(0x272d39))
                     .child(
-                        div()
-                            .flex()
-                            .items_baseline()
-                            .gap_2()
-                            .mr_4()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(0x60a5fa))
-                                    .child(APP_NAME),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::NORMAL)
-                                    .text_color(rgb(0x64748b))
-                                    .child(format!("v{}", APP_VERSION)),
+                        div().flex().items_center().gap_2().flex_shrink_0().mr_2()
+                            .child(div().w(px(6.)).h(px(18.)).rounded_sm().bg(rgb(0x60a5fa)))
+                            .child(div().text_size(px(16.)).font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xe7edf7)).child(APP_NAME))
+                            .child(div().text_size(px(10.)).text_color(rgb(0x748095))
+                                .child(format!("v{}", APP_VERSION))),
+                    )
+                    .child(toolbar_separator())
+                    .child(tool("new", "New")
+                        .on_click(cx.listener(|this, _, w, cx| this.new_file(&NewFile, w, cx))))
+                    .child(
+                        tool_base("open", "Open ▾")
+                            .bg(rgb(0x243a53)).text_color(rgb(0xbfdbfe))
+                            .hover(|style| style.bg(rgb(0x2f4b6a)).text_color(rgb(0xffffff)))
+                            .on_mouse_down(MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open_menu_position = if this.open_menu_position.is_some() {
+                                        None
+                                    } else {
+                                        Some(point(event.position.x, event.position.y + px(20.)))
+                                    };
+                                    this.tab_context_menu = None;
+                                    cx.notify();
+                                }),
                             ),
                     )
-                    .child(tool("toggle-tree", "Explorer").on_click(
-                        cx.listener(|this, _, w, cx| this.toggle_tree(&ToggleTree, w, cx)),
-                    ))
-                    .child(tool("toggle-minimap", if self.minimap_visible { "Minimap ON" } else { "Minimap OFF" }).on_click(
-                        cx.listener(|this, _, w, cx| this.toggle_minimap(&ToggleMinimap, w, cx)),
-                    ))
+                    .child(tool("save", "Save")
+                        .on_click(cx.listener(|this, _, w, cx| this.save_file(&SaveFile, w, cx))))
+                    .child(tool("save-as", "Save As")
+                        .text_color(rgb(0x8b95a7))
+                        .on_click(cx.listener(|this, _, w, cx| this.save_as(&SaveAs, w, cx))))
+                    .child(div().flex_1().min_w(px(12.)))
                     .child(
-                        tool_active("toggle-column", if self.column_mode { "Column: ON (Alt+C)" } else { "Column (Alt+C)" }, self.column_mode)
-                            .on_click(cx.listener(|this, _, w, cx| this.toggle_column_mode(&ToggleColumnMode, w, cx))),
-                    )
-                    .child(
-                        tool("new", "New   Ctrl+N")
-                            .on_click(cx.listener(|this, _, w, cx| this.new_file(&NewFile, w, cx))),
-                    )
-                    .child(
-                        tool("open", "Open ▾").on_mouse_down(MouseButton::Left,
-                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.open_menu_position = if this.open_menu_position.is_some() {
-                                    None
-                                } else {
-                                    Some(point(event.position.x, event.position.y + px(20.)))
-                                };
-                                this.tab_context_menu = None;
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(
-                        tool("save", "Save   Ctrl+S").on_click(
-                            cx.listener(|this, _, w, cx| this.save_file(&SaveFile, w, cx)),
-                        ),
-                    )
-                    .child(
-                        tool("save-as", "Save As")
-                            .on_click(cx.listener(|this, _, w, cx| this.save_as(&SaveAs, w, cx))),
+                        div().flex().items_center().gap_1().flex_shrink_0()
+                            .child(tool_active("toggle-tree", "Explorer", self.tree_visible)
+                                .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(&ToggleTree, w, cx))))
+                            .child(tool_active("toggle-minimap", "Minimap", self.minimap_visible)
+                                .on_click(cx.listener(|this, _, w, cx| this.toggle_minimap(&ToggleMinimap, w, cx))))
+                            .child(toolbar_separator())
+                            .child(tool_active("toggle-column", "Column", self.column_mode)
+                                .on_click(cx.listener(|this, _, w, cx| this.toggle_column_mode(&ToggleColumnMode, w, cx)))),
                     ),
             )
             .child(
@@ -3212,6 +3284,7 @@ fn main() {
                         if let Some(root) = root {
                             let root = normalized_path(&root);
                             editor.tree_cache.clear();
+                            editor.git_decorations.clear();
                             editor.expanded.clear();
                             if let Ok(entries) = read_directory(&root) {
                                 editor.tree_cache.insert(root.clone(), entries);

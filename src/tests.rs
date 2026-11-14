@@ -761,3 +761,31 @@ fn external_file_stamp_detects_write_delete_and_recreation() {
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(super::directory_snapshot(&root), Some(Vec::new()));
     }
+
+
+#[test]
+fn git_decorations_cover_staging_renames_conflicts_and_parent_folders() {
+    use super::{parse_git_decorations, GitDecoration};
+    let root = std::path::Path::new("repo");
+    let data = b" M src/main.rs\0A  src/new.rs\0R  renamed file.rs\0old file.rs\0?? notes.md\0UU src/conflict.rs\0 D removed.rs\0";
+    let states = parse_git_decorations(root, root, data);
+    assert_eq!(states.get(&root.join("src/main.rs")), Some(&GitDecoration::Modified));
+    assert_eq!(states.get(&root.join("src/new.rs")), Some(&GitDecoration::Added));
+    assert_eq!(states.get(&root.join("renamed file.rs")), Some(&GitDecoration::Renamed));
+    assert!(!states.contains_key(&root.join("old file.rs")));
+    assert_eq!(states.get(&root.join("notes.md")), Some(&GitDecoration::Untracked));
+    assert_eq!(states.get(&root.join("removed.rs")), Some(&GitDecoration::Deleted));
+    assert_eq!(states.get(&root.join("src")), Some(&GitDecoration::Conflict));
+    assert_eq!(states.get(root), Some(&GitDecoration::Conflict));
+}
+
+#[test]
+fn git_decorations_scope_unicode_and_clean_snapshots() {
+    use super::{parse_git_decorations, GitDecoration};
+    let repo = std::path::Path::new("repo");
+    let root = repo.join("project");
+    let states = parse_git_decorations(repo, &root, "?? project/中文 file.rs\0 M other/file.rs\0".as_bytes());
+    assert_eq!(states.get(&root.join("中文 file.rs")), Some(&GitDecoration::Untracked));
+    assert!(!states.contains_key(&repo.join("other")));
+    assert!(parse_git_decorations(repo, &root, b"").is_empty());
+}

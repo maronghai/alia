@@ -527,3 +527,17 @@ Open 浮层使用 anchored.position 显式定位窗口原点，容器宽高使�
 ### Menu command dispatch: cancel must not reopen a dialog
 
 Context-menu items consume mouse-down without executing commands and invoke the command only on click. Binding the command to both mouse-down and click opened two native dialogs in sequence, including after Cancel. This applies to Open File, Open Folder, and tab context-menu commands.
+
+
+### Compact grouped toolbar
+
+The 48px toolbar separates file commands on the left from view and column-mode toggles on the right. Open uses a muted blue accent; other commands use lightweight hover surfaces. Toggle dots indicate state without changing label widths. Existing keyboard shortcuts and command dispatch are retained.
+
+## Explorer Git decorations
+
+Use background git --no-optional-locks status --porcelain=v1 -z --untracked-files=all, scoped to the Explorer root. Parse destination/source pairs for renames, and cache decorations for files and ancestors. The virtual list only reads memory. Apply results only when the root still matches; notify only when decorations change. Git errors produce an empty snapshot. Deleted paths decorate existing ancestors without synthetic rows.
+
+
+### Startup crash: duplicate hover style
+
+GPUI 0.2.2 panics when hover() is assigned twice to one element. Toolbar variants now build on tool_base(), which only defines layout; each variant assigns its hover style once. The previous toolbar prevented the first window from rendering.

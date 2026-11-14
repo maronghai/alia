@@ -115,3 +115,7 @@ Opened files are checked in the background approximately once per second using m
 ### Automatic Explorer refresh
 
 Explorer checks the root and expanded directories in the background approximately once per second. Created, renamed and deleted entries appear automatically. Unchanged snapshots do not trigger redraws; expansion state and the scroll handle are retained. Collapsed directories are read when expanded. Explorer has no manual Refresh or Open Folder buttons. Use the toolbar Open menu for Open File (Ctrl+O) or Open Folder (Ctrl+Shift+O).
+
+### Git decorations in Explorer
+
+Explorer checks Git status in the background with its automatic refresh. File names and right-aligned badges show M (modified), A (added), D (deleted), R (renamed), U (conflict), and ? (untracked), including staged changes. Folders summarize descendant changes, prioritizing conflicts. Deleted files appear through their remaining parent folder, not as synthetic file entries. Ignored files are not decorated. Non-repository folders have no Git badges. Git must be available on PATH; status collection failures clear the decorations.
