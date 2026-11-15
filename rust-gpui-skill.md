@@ -814,3 +814,13 @@ The deferred anchored layer uses an explicit window origin and window dimensions
 ## Hard tabs: keep source offsets independent of display width
 
 Do not replace tabs in the document merely to make them visible. Shape display whitespace while retaining original byte indices, expand its advance to the next tab stop, and use matching measurements for wrapping, caret hit testing and horizontal extent. Tab regression tests must cover tabs at column zero and at a stop boundary, consecutive tabs, Unicode text and unchanged source bytes. In this correction 48 tests passed; the new regression checks arithmetic and byte mapping rather than desktop pixels.
+
+
+## 避免在 Change 事件中扫描全文统计字符
+
+InputState 维护 Unicode scalar 字符总数。普通替换及 IME 预编辑按“旧总数 − 被替换片段字符数 + 插入片段字符数”更新；默认值初始化统计一次，输入校验失败恢复旧计数，mask 格式化后重新统计。Change 回调通过 character_count() 常数时间读取，不再遍历完整 Rope。语义与 Rust chars().count() 相同，Emoji 组合与 CRLF 不视作单个字形。整篇替换仍需按替换大小统计；此次优化不改变列光标坐标，也不消除脏状态比对等其它热路径开销。
+
+
+### 输入热路径：可视行范围二分定位
+
+连续输入会触发重新排版。此前 calculate_visible_range 从第一行累计高度到视口，文档越往后成本越高。现在复用 TextWrapper 的累计显示行索引，二分查找可视范围，查找复杂度由 O(视口前行数) 降为 O(log 总逻辑行数)。保留顶部预留逻辑行与真实行高，未修改列光标坐标及尺寸。此项优化不代表已测得整体输入延迟改善，仍需桌面长按验收。

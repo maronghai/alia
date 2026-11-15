@@ -814,3 +814,8 @@ fn hard_tabs_preserve_source_indices_and_tab_stops() {
     assert_eq!(tab_advance(8.0, 32.0), 24.0);
     assert_eq!(tab_advance(32.0, 32.0), 32.0);
 }
+
+use gpui_component::input::Rope;
+mod character_count_regression {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/gpui-component/src/input/character_count.rs"));
+}

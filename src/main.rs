@@ -630,13 +630,16 @@ struct Document {
     saved_text: String,
     large_file: bool,
     disk_stamp: Option<DiskStamp>,
+    edit_revision: u64,
+    saved_revision: u64,
     dirty_cached: bool,
     lines: usize,
     chars: usize,
+    metrics_dirty: bool,
     crlf: bool,
     bom: bool,
     untitled_id: usize,
-    minimap_cache: RefCell<Option<Rc<Vec<Vec<(f32, f32, u32)>>>>>,
+    minimap_cache: RefCell<Option<Rc<RefCell<HashMap<usize, Vec<(f32, f32, u32)>>>>>>,
     git_lines: GitLineChanges,
     _subscription: Subscription,
 }
@@ -894,22 +897,6 @@ impl std::ops::DerefMut for Editor {
     }
 }
 
-// Compare Rope chunks without materializing the full document.
-fn text_matches_saved(input: &InputState, saved: &str) -> bool {
-    let rope = input.text();
-    if rope.len() != saved.len() {
-        return false;
-    }
-    let mut offset = 0;
-    for chunk in rope.chunks() {
-        if saved.as_bytes().get(offset..offset + chunk.len()) != Some(chunk.as_bytes()) {
-            return false;
-        }
-        offset += chunk.len();
-    }
-    true
-}
-
 fn normalized_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -991,15 +978,12 @@ impl Editor {
         });
         let subscription = cx.subscribe_in(&input, window, |this, input, event, _, cx| {
             if matches!(event, InputEvent::Change) {
-                if !this.tabs.iter().any(|doc| doc.input == *input && doc.large_file) {
-                    input.update(cx, |state, cx| state.refresh_highlighter(cx));
-                }
+                // InputState already updates Tree-sitter incrementally for this edit.
                 if let Some(doc) = this.tabs.iter_mut().find(|doc| doc.input == *input) {
                     *doc.minimap_cache.borrow_mut() = None;
-                    let state = input.read(cx);
-                    doc.dirty_cached = !text_matches_saved(state, &doc.saved_text);
-                    doc.lines = state.text().chunks().map(|chunk| chunk.bytes().filter(|b| *b == b'\n').count()).sum::<usize>() + 1;
-                    doc.chars = state.text().chunks().map(|chunk| chunk.chars().count()).sum();
+                    doc.edit_revision = doc.edit_revision.wrapping_add(1);
+                    doc.dirty_cached = doc.edit_revision != doc.saved_revision;
+                    doc.metrics_dirty = true;
                 }
                 cx.notify();
             }
@@ -1010,9 +994,12 @@ impl Editor {
             saved_text: String::new(),
             large_file: false,
             disk_stamp: None,
+            edit_revision: 0,
+            saved_revision: 0,
             dirty_cached: false,
             lines: 1,
             chars: 0,
+            metrics_dirty: false,
             crlf: true,
             bom: false,
             untitled_id,
@@ -1133,7 +1120,7 @@ impl Editor {
                                     editor.message = format!("File removed or unavailable: {} — local content kept", path.display());
                                     cx.notify();
                             match external_change(&doc.saved_text, doc.crlf, doc.bom,
-                                !text_matches_saved(doc.input.read(cx), &doc.saved_text), &bytes) {
+                                doc.dirty_cached, &bytes) {
                                 ExternalChange::Unchanged => {},
                                 ExternalChange::Conflict => {
                                     editor.message = format!("External changes: {} — local edits kept; save to resolve", path.display());
@@ -1158,6 +1145,9 @@ impl Editor {
                                             state.set_cursor_position(cursor, window, cx);
                                             state.refresh_highlighter(cx);
                                         });
+                                        doc.edit_revision = doc.edit_revision.wrapping_add(1);
+                                        doc.saved_revision = doc.edit_revision;
+                                        doc.dirty_cached = false;
                                         editor.message = format!("Reloaded external changes: {}", path.display());
                                         cx.notify();
                                     }
@@ -1210,8 +1200,8 @@ impl Editor {
     fn text(&self, cx: &App) -> String {
         self.input.read(cx).value().to_string()
     }
-    fn dirty(&self, cx: &App) -> bool {
-        !text_matches_saved(self.input.read(cx), &self.saved_text)
+    fn dirty(&self, _cx: &App) -> bool {
+        self.dirty_cached
     }
 
     fn error(&mut self, message: String, cx: &mut Context<Self>) {
@@ -1298,6 +1288,7 @@ impl Editor {
         self.git_lines = git_line_changes(&path);
         self.update_language(cx);
         self.saved_text = text;
+        self.saved_revision = self.edit_revision;
         self.dirty_cached = false;
         self.reveal_active_in_tree();
         self.message = "Saved".into();
@@ -1588,7 +1579,8 @@ impl Editor {
 
     fn toggle_bom_active(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.bom = !self.bom;
-        self.dirty_cached = true;
+        self.edit_revision = self.edit_revision.wrapping_add(1);
+        self.dirty_cached = self.edit_revision != self.saved_revision;
         self.message = if self.bom {
             "Encoding changed: UTF-8 with BOM (Bompad)".into()
         } else {
@@ -1609,7 +1601,10 @@ impl Editor {
         self.input.update(cx, |state, cx| {
             state.set_value(converted, window, cx);
         });
-        self.dirty_cached = true;
+        if self.edit_revision == self.saved_revision {
+            self.edit_revision = self.edit_revision.wrapping_add(1);
+        }
+        self.dirty_cached = self.edit_revision != self.saved_revision;
         self.message = if new_crlf {
             "Line endings: CRLF (Windows)".into()
         } else {
@@ -1972,8 +1967,8 @@ impl Editor {
                 self.lines = lines;
                 self.chars = chars;
                 self.input.update(cx, |state, cx| state.set_soft_wrap(!large, window, cx));
-                self.dirty_cached = false;
                 self.saved_text = text.clone();
+                self.dirty_cached = false;
                 self.crlf = crlf;
                 self.bom = bom;
                 self.input.update(cx, |state, cx| {
@@ -1983,6 +1978,9 @@ impl Editor {
                     }
                     state.focus(window, cx);
                 });
+                self.edit_revision = self.edit_revision.wrapping_add(1);
+                self.saved_revision = self.edit_revision;
+                self.dirty_cached = false;
                 self.reveal_active_in_tree();
                 self.message = if large { "Large file mode: syntax, minimap and Git line markers paused" } else { "File opened" }.into();
                 cx.notify();
@@ -2259,14 +2257,9 @@ impl Editor {
         let cursor = (input.cursor_position().line as usize).min(total.saturating_sub(1));
         let samples = {
             let mut cache = self.minimap_cache.borrow_mut();
-            cache.get_or_insert_with(|| {
-                let lines_to_cache = total.min(10000);
-                Rc::new((0..lines_to_cache).map(|row| {
-                    let text = rope.slice_line(row).chars().take(160).collect::<String>();
-                    minimap_segments(&text)
-                }).collect())
-            }).clone()
+            cache.get_or_insert_with(|| Rc::new(RefCell::new(HashMap::new()))).clone()
         };
+        let minimap_text = rope.clone();
         let bounds_cell = Rc::new(Cell::new(Bounds::default()));
         let paint_bounds = bounds_cell.clone();
 
@@ -2368,10 +2361,15 @@ impl Editor {
                     paint(0., scroll_info.slider_y, 140., 1.0, rgba(0xa0c0e844).into());
                     paint(0., scroll_info.slider_y + scroll_info.slider_height - 1.0, 140., 1.0, rgba(0xa0c0e844).into());
 
+                    let mut samples = samples.borrow_mut();
                     for row in scroll_info.visible_range {
-                        if let Some(segments) = samples.get(row) {
+                        let segments = samples.entry(row).or_insert_with(|| {
+                            let text = minimap_text.slice_line(row).chars().take(160).collect::<String>();
+                            minimap_segments(&text)
+                        });
+                        {
                             let y = (row as f32 * MINIMAP_LINE_HEIGHT) - scroll_info.scroll_y;
-                            for &(x, width, color) in segments {
+                            for &(x, width, color) in segments.iter() {
                                 paint(6. + x, y, width, 1.6, rgb(color).into());
                             }
                         }
@@ -2944,8 +2942,22 @@ fn toggle_column_mode(&mut self, _: &ToggleColumnMode, window: &mut Window, cx: 
                 cx.notify();
             }))
             .child(canvas(move |_, _, _| {}, move |bounds, _, window, cx| {
-                let row_bounds = input.read(cx).column_caret_bounds(0, total_lines.saturating_sub(1), 0, 0);
-                for (line, caret, _) in row_bounds {
+                // Direction-key redraws must not lay out every document line. The
+                // gutter only paints rows that actually have a Git change.
+                let mut changed: Vec<usize> = changes.added.iter()
+                    .chain(changes.modified.iter())
+                    .chain(changes.deleted_before.iter())
+                    .copied()
+                    .filter(|line| *line < total_lines)
+                    .collect();
+                changed.sort_unstable();
+                changed.dedup();
+                let input_state = input.read(cx);
+                for line in changed {
+                    let Some((_, caret, _)) = input_state
+                        .column_caret_bounds(line, line, 0, 0)
+                        .into_iter()
+                        .next() else { continue; };
                     let color = match changes.kind_at(line) {
                         Some(GitLineKind::Added) => 0x73c991,
                         Some(GitLineKind::Modified) => 0xe2c08d,
@@ -3000,6 +3012,12 @@ impl Render for Editor {
         if self.last_window_title != title {
             window.set_window_title(&title);
             self.last_window_title = title;
+        }
+        if self.metrics_dirty {
+            let state = self.input.read(cx);
+            self.lines = state.text().lines_len();
+            self.chars = state.character_count();
+            self.metrics_dirty = false;
         }
         let lines = self.lines;
         let chars = self.chars;
@@ -3295,7 +3313,10 @@ impl Render for Editor {
                                                     .font_family("Cascadia Code")
                                                     .text_size(px(16.)),
                                             )
-                                            .child(self.git_change_gutter(cx))
+                                            .children((!self.git_lines.added.is_empty()
+                                                || !self.git_lines.modified.is_empty()
+                                                || !self.git_lines.deleted_before.is_empty())
+                                                .then(|| self.git_change_gutter(cx)))
                                             .children(self.column_mode.then(|| self.column_cursors_overlay(cx))),
                                     )
                                     .children((self.minimap_visible && !self.large_file).then(|| self.minimap_panel(cx))),

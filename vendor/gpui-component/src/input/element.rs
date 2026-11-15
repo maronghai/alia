@@ -485,38 +485,15 @@ impl TextElement {
         line_height: Pixels,
         input_height: Pixels,
     ) -> (Range<usize>, Pixels) {
-        // Add extra rows to avoid showing empty space when scroll to bottom.
-        let extra_rows = 1;
-        let mut visible_top = px(0.);
         if state.mode.is_single_line() {
-            return (0..1, visible_top);
+            return (0..1, px(0.));
         }
-
-        let total_lines = state.text_wrapper.len();
-        let scroll_top = if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
-            deferred_scroll_offset.y
-        } else {
-            state.scroll_handle.offset().y
-        };
-
-        let mut visible_range = 0..total_lines;
-        let mut line_bottom = px(0.);
-        for (ix, line) in state.text_wrapper.lines.iter().enumerate() {
-            let wrapped_height = line.height(line_height);
-            line_bottom += wrapped_height;
-
-            if line_bottom < -scroll_top {
-                visible_top = line_bottom - wrapped_height;
-                visible_range.start = ix;
-            }
-
-            if line_bottom + scroll_top >= input_height {
-                visible_range.end = (ix + extra_rows).min(total_lines);
-                break;
-            }
-        }
-
-        (visible_range, visible_top)
+        let scroll_top = state.deferred_scroll_offset
+            .unwrap_or_else(|| state.scroll_handle.offset()).y;
+        let (range, top) = state.text_wrapper.viewport_range(
+            -f32::from(scroll_top), f32::from(input_height), f32::from(line_height),
+        );
+        (range, px(top))
     }
 
     /// Return (line_number_width, line_number_len)

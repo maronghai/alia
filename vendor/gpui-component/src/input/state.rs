@@ -2,6 +2,10 @@
 //!
 //! Based on the `Input` example from the `gpui` crate.
 //! https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/input.rs
+#[path = "character_count.rs"]
+mod character_count;
+use character_count::character_count_after_edit;
+
 use anyhow::Result;
 use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
@@ -262,6 +266,7 @@ pub struct InputState {
     pub(super) focus_handle: FocusHandle,
     pub(super) mode: InputMode,
     pub(super) text: Rope,
+    character_count: usize,
     pub(super) text_wrapper: TextWrapper,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
@@ -369,6 +374,7 @@ impl InputState {
         Self {
             focus_handle: focus_handle.clone(),
             text: "".into(),
+            character_count: 0,
             text_wrapper: TextWrapper::new(text_style.font(), window.rem_size(), None),
             blink_cursor,
             history,
@@ -791,6 +797,7 @@ impl InputState {
     /// Set the default value of the input field.
     pub fn default_value(mut self, value: impl Into<SharedString>) -> Self {
         let text: SharedString = value.into();
+        self.character_count = text.chars().count();
         self.text = Rope::from(text.as_str());
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
@@ -811,6 +818,11 @@ impl InputState {
     }
 
     /// Return the text [`Rope`] of the input field.
+    /// Number of Unicode scalar values, maintained incrementally on edits.
+    pub fn character_count(&self) -> usize {
+        self.character_count
+    }
+
     pub fn text(&self) -> &Rope {
         &self.text
     }
@@ -2027,6 +2039,10 @@ impl EntityInputHandler for InputState {
             .unwrap_or(self.selected_range.into());
 
         let old_text = self.text.clone();
+        let old_character_count = self.character_count;
+        self.character_count = character_count_after_edit(
+            &self.text, self.character_count, range.clone(), new_text,
+        );
         self.text.replace(range.clone(), new_text);
 
         let mut new_offset = (range.start + new_text.len()).min(self.text.len());
@@ -2036,11 +2052,13 @@ impl EntityInputHandler for InputState {
             // Check if the new text is valid
             if !self.is_valid_input(&pending_text, cx) {
                 self.text = old_text;
+                self.character_count = old_character_count;
                 return;
             }
 
             if !self.mask_pattern.is_none() {
                 let mask_text = self.mask_pattern.mask(&pending_text);
+                self.character_count = mask_text.chars().count();
                 self.text = Rope::from(mask_text.as_str());
                 let new_text_len =
                     (new_text.len() + mask_text.len()).saturating_sub(pending_text.len());
@@ -2095,12 +2113,17 @@ impl EntityInputHandler for InputState {
             .unwrap_or(self.selected_range.into());
 
         let old_text = self.text.clone();
+        let old_character_count = self.character_count;
+        self.character_count = character_count_after_edit(
+            &self.text, self.character_count, range.clone(), new_text,
+        );
         self.text.replace(range.clone(), new_text);
 
         if self.mode.is_single_line() {
             let pending_text = self.text.to_string();
             if !self.is_valid_input(&pending_text, cx) {
                 self.text = old_text;
+                self.character_count = old_character_count;
                 return;
             }
         }

@@ -51,6 +51,7 @@ pub(super) struct TextWrapper {
     text: Rope,
     /// Total wrapped lines (Inlucde the first line), value is start and end index of the line.
     soft_lines: usize,
+    display_row_starts: Vec<usize>,
     font: Font,
     font_size: Pixels,
     /// If is none, it means the text is not wrapped
@@ -72,6 +73,7 @@ impl TextWrapper {
             font_size,
             wrap_width,
             soft_lines: 0,
+            display_row_starts: Vec::new(),
             longest_row: LongestRow::default(),
             lines: Vec::new(),
             _initialized: false,
@@ -92,7 +94,7 @@ impl TextWrapper {
     /// Get the line item by row index.
     #[inline]
     pub(super) fn line(&self, row: usize) -> Option<&LineItem> {
-        self.lines.iter().skip(row).next()
+        self.lines.get(row)
     }
 
     pub(super) fn set_wrap_width(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
@@ -236,7 +238,20 @@ impl TextWrapper {
         }
 
         self.text = changed_text.clone();
-        self.soft_lines = self.lines.iter().map(|l| l.lines_len()).sum();
+        let unchanged_row_heights = self.display_row_starts.len() == self.lines.len()
+            && (start_row..=new_end_row).all(|row| {
+                let end = self.display_row_starts.get(row + 1).copied().unwrap_or(self.soft_lines);
+                end - self.display_row_starts[row] == self.lines[row].lines_len()
+            });
+        if !unchanged_row_heights {
+        self.display_row_starts.clear();
+        let mut total = 0;
+        for line in &self.lines {
+            self.display_row_starts.push(total);
+            total += line.lines_len();
+        }
+        self.soft_lines = total;
+        }
         self.longest_row = LongestRow {
             row: longest_row_ix,
             len: longest_row_len,
@@ -250,6 +265,12 @@ impl TextWrapper {
         self.update(text, &(0..text.len()), &text, cx);
     }
 
+    /// Locate viewport rows using the cached display-row prefix sums.
+    /// Keep one preceding logical row, matching the previous scrolling layout.
+    pub(super) fn viewport_range(&self, top: f32, height: f32, line_height: f32) -> (Range<usize>, f32) {
+        indexed_viewport_range(&self.display_row_starts, self.soft_lines, top, height, line_height)
+    }
+
     /// Return display point (with soft wrap) from the given byte offset in the text.
     ///
     /// Panics if the `offset` is out of bounds.
@@ -258,12 +279,7 @@ impl TextWrapper {
         let start = self.text.line_start_offset(row);
         let line = &self.lines[row];
 
-        let mut wrapped_row = self
-            .lines
-            .iter()
-            .take(row)
-            .map(|l| l.lines_len())
-            .sum::<usize>();
+        let wrapped_row = self.display_row_starts[row];
 
         let local_offset = offset.saturating_sub(start);
         for (ix, range) in line.wrapped_lines.iter().enumerate() {
@@ -286,23 +302,18 @@ impl TextWrapper {
     ///
     /// Panics if the `point.row` is out of bounds.
     pub(crate) fn display_point_to_offset(&self, point: DisplayPoint) -> usize {
-        let mut wrapped_row = 0;
-        for (row, line) in self.lines.iter().enumerate() {
-            if wrapped_row + line.lines_len() > point.row {
-                let line_start = self.text.line_start_offset(row);
-                let local_row = point.row.saturating_sub(wrapped_row);
-                if let Some(range) = line.wrapped_lines.get(local_row) {
-                    return line_start + (range.start + point.column).min(range.end);
-                } else {
-                    // If not found, return the end of the line.
-                    return line_start + line.len();
-                }
-            }
-
-            wrapped_row += line.lines_len();
+        if point.row >= self.soft_lines {
+            return self.text.len();
         }
-
-        return self.text.len();
+        let row = self.display_row_starts.partition_point(|start| *start <= point.row)
+            .saturating_sub(1);
+        let Some(line) = self.lines.get(row) else { return self.text.len(); };
+        let line_start = self.text.line_start_offset(row);
+        let local_row = point.row - self.display_row_starts[row];
+        match line.wrapped_lines.get(local_row) {
+            Some(range) => line_start + (range.start + point.column).min(range.end),
+            None => line_start + line.len(),
+        }
     }
 
     pub(crate) fn display_point_to_point(&self, point: DisplayPoint) -> tree_sitter::Point {
@@ -314,6 +325,23 @@ impl TextWrapper {
         let offset = self.text.point_to_offset(point);
         self.offset_to_display_point(offset)
     }
+}
+
+/// Binary search logical rows without scanning the document on each paint.
+pub(crate) fn indexed_viewport_range(starts: &[usize], total: usize, top: f32, height: f32, line_height: f32) -> (Range<usize>, f32) {
+    if starts.is_empty() || line_height <= 0.0 { return (0..0, 0.0); }
+    let bottom = |row: usize| starts.get(row + 1).copied().unwrap_or(total) as f32 * line_height;
+    let search = |target: f32| {
+        let (mut lo, mut hi) = (0, starts.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if bottom(mid) < target { lo = mid + 1; } else { hi = mid; }
+        }
+        lo
+    };
+    let preceding = search(top).saturating_sub(1);
+    let end = search(top + height).saturating_add(1).min(starts.len());
+    (preceding..end, starts[preceding] as f32 * line_height)
 }
 
 /// The actually display point in the text.
