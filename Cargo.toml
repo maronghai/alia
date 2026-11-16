@@ -1,9 +1,12 @@
 [package]
 name = "alia"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 
 [dependencies]
 gpui = "0.2.2"
 gpui-component = { path = "vendor/gpui-component", version = "=0.5.0", features = ["tree-sitter-languages"] }
 rfd = "0.15"
+
+[build-dependencies]
+embed-resource = "3"

@@ -1,0 +1,3 @@
+// Application icon. GPUI loads icon resource ID 1 as the window/taskbar icon,
+// and Explorer uses the first icon group as the .exe icon.
+1 ICON "assets/alia.ico"

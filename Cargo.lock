@@ -44,8 +44,9 @@ dependencies = [
 
 [[package]]
 name = "alia"
-version = "0.5.5"
+version = "0.6.1"
 dependencies = [
+ "embed-resource",
  "gpui",
  "gpui-component",
  "rfd",
