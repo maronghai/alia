@@ -858,6 +858,9 @@ struct Editor {
     active_tab: usize,
     next_untitled_id: usize,
     tree_root: Option<PathBuf>,
+    /// Folder chosen explicitly (Open Folder / folder argument). The explorer returns
+    /// to it whenever the active file lives inside it.
+    pinned_root: Option<PathBuf>,
     tree_cache: HashMap<PathBuf, Vec<TreeEntry>>,
     git_decorations: HashMap<PathBuf, GitDecoration>,
     expanded: HashSet<PathBuf>,
@@ -924,6 +927,18 @@ fn ancestor_dirs_under_root(child: &Path, root: &Path) -> Vec<PathBuf> {
         }
     }
     ancestors
+}
+
+/// Decide which folder the explorer must show so that `file` is visible.
+/// Returns `None` when the current root already contains the file.
+fn explorer_root_for_file(file: &Path, current: Option<&Path>, pinned: Option<&Path>) -> Option<PathBuf> {
+    if current.is_some_and(|root| file.starts_with(root)) {
+        return None;
+    }
+    if let Some(pinned) = pinned.filter(|root| file.starts_with(root)) {
+        return Some(pinned.to_path_buf());
+    }
+    file.parent().map(Path::to_path_buf)
 }
 
 fn next_tab_index(active: usize, count: usize, forward: bool) -> usize {
@@ -1026,6 +1041,7 @@ impl Editor {
             active_tab: 0,
             next_untitled_id: 2,
             tree_root,
+            pinned_root: None,
             tree_cache,
             git_decorations: HashMap::new(),
             expanded: HashSet::new(),
@@ -1059,7 +1075,8 @@ impl Editor {
             loop {
                 Timer::after(std::time::Duration::from_secs(1)).await;
                 let Ok((requests, tree_root, directories)) = view.update(cx, |editor, _| {
-                    let directories = editor.tree_root.iter().chain(editor.expanded.iter())
+                    let under_root = |path: &&PathBuf| editor.tree_root.as_ref().is_some_and(|root| path.starts_with(root));
+                    let directories = editor.tree_root.iter().chain(editor.expanded.iter().filter(under_root))
                         .map(|path| (path.clone(), editor.tree_cache.get(path).cloned()))
                         .collect::<Vec<_>>();
                     let requests = editor.tabs.iter().filter_map(|doc| doc.path.clone().map(|path|
@@ -1113,12 +1130,15 @@ impl Editor {
                             }
                             // A save/open may have completed while the background read was in flight.
                             if doc.disk_stamp != previous { continue; }
+                            let removed = stamp.is_none() && previous.is_some();
                             doc.disk_stamp = stamp;
                             let Some(bytes) = bytes else {
-                                continue;
-                            };
+                                if removed {
                                     editor.message = format!("File removed or unavailable: {} — local content kept", path.display());
                                     cx.notify();
+                                }
+                                continue;
+                            };
                             match external_change(&doc.saved_text, doc.crlf, doc.bom,
                                 doc.dirty_cached, &bytes) {
                                 ExternalChange::Unchanged => {},
@@ -1165,22 +1185,58 @@ impl Editor {
         editor
     }
 
+    /// Switch the explorer to `root`. Expansion state is kept so that coming back to a
+    /// folder restores its layout. Returns whether the root actually changed.
+    fn set_tree_root(&mut self, root: PathBuf) -> bool {
+        if self.tree_root.as_ref() == Some(&root) {
+            return false;
+        }
+        let Ok(entries) = read_directory(&root) else {
+            return false;
+        };
+        self.tree_cache.insert(root.clone(), entries);
+        self.git_decorations.clear();
+        self.tree_root = Some(root);
+        true
+    }
+
     fn reveal_active_in_tree(&mut self) {
+        self.reveal_active_in_tree_with(true);
+    }
+
+    /// Expand and select the active file in the explorer. With `follow_root`, the
+    /// explorer switches folders when the file is outside the current root.
+    fn reveal_active_in_tree_with(&mut self, follow_root: bool) {
         let Some(current_path) = self.path.clone() else {
             return;
         };
+        let mut changed = false;
+        if follow_root {
+            if let Some(root) = explorer_root_for_file(
+                &current_path, self.tree_root.as_deref(), self.pinned_root.as_deref()) {
+                changed |= self.set_tree_root(root);
+            }
+        }
         let Some(root) = self.tree_root.clone() else {
             return;
         };
-        let ancestors = ancestor_dirs_under_root(&current_path, &root);
-        let mut changed = false;
-        for dir in ancestors {
-            if self.expanded.insert(dir.clone()) {
-                changed = true;
-            }
-            if !self.tree_cache.contains_key(&dir) {
+        for dir in ancestor_dirs_under_root(&current_path, &root) {
+            let newly_expanded = self.expanded.insert(dir.clone());
+            // A folder that was collapsed is no longer polled, so its cached listing may be stale.
+            if newly_expanded || !self.tree_cache.contains_key(&dir) {
                 if let Ok(entries) = read_directory(&dir) {
                     self.tree_cache.insert(dir, entries);
+                }
+                changed = true;
+            }
+        }
+        // Files created by Save As (or externally a moment ago) may be missing from the cache.
+        if let Some(parent) = current_path.parent().filter(|parent| parent.starts_with(&root)) {
+            let listed = self.tree_cache.get(parent)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.path == current_path));
+            if !listed {
+                if let Ok(entries) = read_directory(parent) {
+                    self.tree_cache.insert(parent.to_path_buf(), entries);
                     changed = true;
                 }
             }
@@ -2011,8 +2067,10 @@ impl Editor {
                     } else {
                         self.tree_cache.insert(root.clone(), entries);
                     }
+                    self.pinned_root = Some(root.clone());
                     self.tree_root = Some(root);
-                    self.reveal_active_in_tree();
+                    // The user chose this folder explicitly: keep it even if the active file is elsewhere.
+                    self.reveal_active_in_tree_with(false);
                     self.rebuild_flattened_tree();
                     self.tree_visible = true;
                     self.message = "Folder opened".into();
@@ -2034,7 +2092,7 @@ impl Editor {
         let Some(root) = self.tree_root.clone() else {
             return;
         };
-        let mut paths: Vec<_> = self.expanded.iter().cloned().collect();
+        let mut paths: Vec<_> = self.expanded.iter().filter(|path| path.starts_with(&root)).cloned().collect();
         paths.push(root);
         let mut errors = Vec::new();
         for path in paths {
@@ -3513,6 +3571,9 @@ fn main() {
                             editor.expanded.clear();
                             if let Ok(entries) = read_directory(&root) {
                                 editor.tree_cache.insert(root.clone(), entries);
+                            }
+                            if path.is_dir() {
+                                editor.pinned_root = Some(root.clone());
                             }
                             editor.tree_root = Some(root);
                         }

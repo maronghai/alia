@@ -764,6 +764,27 @@ fn external_file_stamp_detects_write_delete_and_recreation() {
 
 
 #[test]
+fn explorer_follows_files_outside_root_and_returns_to_pinned_folder() {
+    use super::explorer_root_for_file;
+    use std::path::{Path, PathBuf};
+    let project = Path::new("/work/project");
+    let other = Path::new("/notes");
+    let inside = project.join("src/main.rs");
+    let outside = other.join("todo.md");
+    // Already visible: keep the current root.
+    assert_eq!(explorer_root_for_file(&inside, Some(project), None), None);
+    // Outside the current root: show the file's folder.
+    assert_eq!(explorer_root_for_file(&outside, Some(project), None), Some(other.to_path_buf()));
+    assert_eq!(explorer_root_for_file(&outside, None, None), Some(other.to_path_buf()));
+    // Back inside the explicitly opened folder: return to it, not just the file's parent.
+    assert_eq!(explorer_root_for_file(&inside, Some(other), Some(project)), Some(project.to_path_buf()));
+    // A sibling folder with a common name prefix is not "inside".
+    let sibling = PathBuf::from("/work/project-old/a.rs");
+    assert_eq!(explorer_root_for_file(&sibling, Some(project), Some(project)),
+        Some(PathBuf::from("/work/project-old")));
+}
+
+#[test]
 fn git_decorations_cover_staging_renames_conflicts_and_parent_folders() {
     use super::{parse_git_decorations, GitDecoration};
     let root = std::path::Path::new("repo");
